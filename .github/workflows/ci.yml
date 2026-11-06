@@ -22,7 +22,7 @@ jobs:
       - run: rustfmt --check --edition 2024 src/lib.rs src/main.rs tests/review_cli.rs
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: python -m pip install --quiet pyyaml
