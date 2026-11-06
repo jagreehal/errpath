@@ -1,0 +1,194 @@
+name: 'errpath review'
+description: >-
+  Reviews how a pull request changes error propagation, recovery and panic paths
+  in Rust, as one sticky PR comment, inline annotations and the job summary.
+author: 'Jag Reehal'
+branding:
+  icon: 'git-pull-request'
+  color: 'orange'
+
+inputs:
+  path:
+    description: 'Repo-relative paths to review, space separated. Empty reviews everything.'
+    default: ''
+  base:
+    description: 'Ref to compare from. Defaults to the PR base, or the previous commit on push. The review starts at its merge base with head.'
+    default: ''
+  head:
+    description: 'Ref holding the change. Defaults to the PR head, or HEAD on push.'
+    default: ''
+  comment:
+    description: 'Post (and keep updating) one review comment on the pull request.'
+    default: 'true'
+  comment-on:
+    description: 'Lowest risk that gets a PR comment: low, moderate or high. Everything still goes in the job summary.'
+    default: 'moderate'
+  annotations:
+    description: 'Annotate new findings inline in the Files changed tab.'
+    default: 'true'
+  fail-on:
+    description: 'Fail the job at this risk or above: never, moderate or high.'
+    default: 'never'
+  diagrams:
+    description: 'Mermaid diagrams in the comment: open or collapsed.'
+    default: 'collapsed'
+  version:
+    description: 'cargo-errpath version to install, like 0.1.0. Empty matches the tag this action runs from, or the latest release.'
+    default: ''
+  cli:
+    description: 'Command that runs errpath, instead of installing it, like "target/release/cargo-errpath".'
+    default: ''
+  github-token:
+    description: 'Token used to post the comment.'
+    default: ${{ github.token }}
+
+outputs:
+  risk:
+    description: 'Risk: low, moderate or high.'
+    value: ${{ steps.review.outputs.risk }}
+  changed:
+    description: 'Whether any change to a failure path was seen.'
+    value: ${{ steps.review.outputs.changed }}
+  report:
+    description: 'Path of the JSON report.'
+    value: ${{ steps.review.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install errpath
+      if: inputs.cli == ''
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        set -euo pipefail
+        version="$VERSION"
+        if [ -z "$version" ]; then
+          case "$ACTION_REF" in v[0-9]*.[0-9]*.[0-9]*) version="${ACTION_REF#v}" ;; esac
+        fi
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64) target=x86_64-unknown-linux-gnu ;;
+          Linux-ARM64) target=aarch64-unknown-linux-gnu ;;
+          macOS-ARM64) target=aarch64-apple-darwin ;;
+          *) target='' ;;
+        esac
+        releases=https://github.com/jagreehal/errpath/releases
+        if [ -n "$version" ]; then url="$releases/download/v$version"; else url="$releases/latest/download"; fi
+        dir="$RUNNER_TEMP/errpath-bin"
+        mkdir -p "$dir"
+        if [ -n "$target" ] && curl -fsSL "$url/cargo-errpath-$target.tar.gz" | tar -xz -C "$dir"; then
+          echo "$dir" >> "$GITHUB_PATH"
+        else
+          echo "::notice::No prebuilt errpath for this runner, so building it"
+          cargo install cargo-errpath --locked ${version:+--version "$version"}
+        fi
+
+    - name: Resolve refs
+      id: refs
+      shell: bash
+      env:
+        INPUT_BASE: ${{ inputs.base }}
+        INPUT_HEAD: ${{ inputs.head }}
+        PR_BASE: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        PUSH_BEFORE: ${{ github.event.before }}
+      run: |
+        base="${INPUT_BASE:-${PR_BASE:-$PUSH_BEFORE}}"
+        head="${INPUT_HEAD:-${PR_HEAD:-HEAD}}"
+        # The merge base needs history, which a default checkout doesn't have.
+        if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+          git fetch --no-tags --unshallow origin 2>/dev/null || true
+        fi
+        # First push of a branch has an all-zero "before".
+        case "$base" in ''|0000000000000000000000000000000000000000) base=HEAD~1 ;; esac
+        git fetch --no-tags origin "$base" "$head" 2>/dev/null || true
+        echo "base=$base" >> "$GITHUB_OUTPUT"
+        echo "head=$head" >> "$GITHUB_OUTPUT"
+
+    - name: Review
+      id: review
+      shell: bash
+      env:
+        CLI: ${{ inputs.cli }}
+        PATHS: ${{ inputs.path }}
+        DIAGRAMS: ${{ inputs.diagrams }}
+        COMMENT_ON: ${{ inputs.comment-on }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        BASE: ${{ steps.refs.outputs.base }}
+        HEAD: ${{ steps.refs.outputs.head }}
+      run: |
+        set -euo pipefail
+        case "$COMMENT_ON" in low|moderate|high) ;; *) echo "::error::comment-on must be low, moderate or high"; exit 1 ;; esac
+        case "$FAIL_ON" in never|moderate|high) ;; *) echo "::error::fail-on must be never, moderate or high"; exit 1 ;; esac
+        out="$RUNNER_TEMP/errpath-review"
+        mkdir -p "$out"
+        read -ra cli <<< "${CLI:-cargo-errpath}"
+        read -ra paths <<< "$PATHS"
+        "${cli[@]}" review ${paths[@]+"${paths[@]}"} --diagrams "$DIAGRAMS" --base "$BASE" --head "$HEAD" --format json -o "$out/review.json"
+        jq -r .markdown "$out/review.json" > "$out/review.md"
+        jq -r 'if .changed then .markdown else .summary end' "$out/review.json" >> "$GITHUB_STEP_SUMMARY"
+        at_least() { jq -r --arg at "$1" '{"low": 1, "moderate": 2, "high": 3} as $r | .changed and $r[.risk] >= ($r[$at] // 9)' "$out/review.json"; }
+        {
+          echo "risk=$(jq -r .risk "$out/review.json")"
+          echo "changed=$(jq -r .changed "$out/review.json")"
+          echo "report=$out/review.json"
+          echo "dir=$out"
+          echo "comment=$(at_least "$COMMENT_ON")"
+          echo "fail=$(at_least "$FAIL_ON")"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Annotate new findings
+      if: inputs.annotations == 'true'
+      shell: bash
+      env:
+        DIR: ${{ steps.review.outputs.dir }}
+      run: |
+        # Workflow-command escaping: % \r \n in the message; also , and : in properties.
+        jq -r '
+          def msg: gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A");
+          def prop: msg | gsub(","; "%2C") | gsub(":"; "%3A");
+          .newFindings[]
+          | "::\(if .severity == "error" then "error" else "warning" end) file=\(.file | prop),line=\(.line),title=\("errpath " + .rule | prop)::\(.message | msg)"
+        ' "$DIR/review.json"
+
+    - name: Update review comment
+      if: inputs.comment == 'true' && github.event.pull_request
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        DIR: ${{ steps.review.outputs.dir }}
+        WANTED: ${{ steps.review.outputs.comment }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+      run: |
+        set -uo pipefail
+        marker='<!-- cargo-errpath-review -->'
+        existing=$( (gh api "repos/$REPO/issues/$PR/comments" --paginate \
+          --jq "map(select(.body | startswith(\"$marker\"))) | .[].id" || true) | head -n1)
+        # A fork PR's token is read-only: the summary and annotations still land,
+        # so a comment that can't be posted is a warning, not a failed review.
+        update() {
+          if [ "$WANTED" = true ] && [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -F body=@"$DIR/review.md" --silent
+          elif [ "$WANTED" = true ]; then
+            gh api "repos/$REPO/issues/$PR/comments" -F body=@"$DIR/review.md" --silent
+          elif [ -n "$existing" ]; then
+            # The PR has moved on, so an old comment would now be wrong.
+            gh api -X DELETE "repos/$REPO/issues/comments/$existing" --silent
+          fi
+        }
+        update || echo "::warning::errpath could not update the review comment (read-only token? fork PR?). The report is in the job summary."
+
+    - name: Gate
+      shell: bash
+      env:
+        FAIL: ${{ steps.review.outputs.fail }}
+        RISK: ${{ steps.review.outputs.risk }}
+        FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        if [ "$FAIL" = true ]; then
+          echo "::error::errpath: $RISK risk, and fail-on is $FAIL_ON (see the job summary)"
+          exit 1
+        fi

@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # `examples/` is left alone: the tests assert line numbers in those fixtures.
+      - run: rustfmt --check --edition 2024 src/lib.rs src/main.rs tests/review_cli.rs
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: python -m pip install --quiet pyyaml
+      - run: python tests/action_steps.py
