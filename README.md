@@ -1,80 +1,152 @@
 # errpath
 
-See how a Rust PR changes error propagation, recovery and panic paths.
+**See how a Rust pull request changes error handling.**
 
-`errpath` compares two git refs and reports what changed about how each function can fail. It reads syntax only, so it needs no build, and it works on plain Rust with no library to adopt.
+`errpath` is a CLI and GitHub Action that highlights new panic paths, dropped errors and changes to error propagation. Reviewers get a focused before-and-after report, with diagrams showing where failures leave each function.
 
-You hear nothing when failure paths stay the same. A rename, a reformat or a new comment produces no output.
-
-## Why
-
-A dependency update changes one line:
-
-```diff
--    builder.build()
-+    builder.build().unwrap()
-```
-
-The PR title says nothing about it, and it compiles. Run over that commit, `errpath` reports:
-
-```
-## Error path review: moderate risk
-
-1 function changed, 1 new finding.
-
-### New findings
-
-- `no-panic` `builder.build.unwrap can panic` at `src/dns/resolver.rs:3`
-
-### Changed error paths
-
-#### `dns::resolver::new_resolver`
-
-- added panic path `builder.build.unwrap`
-```
-
-Clippy lints a single `unwrap`, and those lints are worth keeping. `errpath` shows what a change did to the ways your code can fail. It reports only what that change introduced, so it works on a codebase with years of existing `unwrap`s.
-
-## Install
+It reads Rust source directly. No build required, and nothing to add to your project.
 
 ```bash
 cargo install cargo-errpath
 ```
 
-## Use
+## Your function, as a diagram
 
-```bash
-# What changed between two refs
-cargo errpath review --base main
-
-# The same, as JSON, with collapsed diagrams
-cargo errpath review --base main --head my-branch --format json -o review.json
-cargo errpath review --base main --diagrams collapsed
-
-# Limit the review to some paths
-cargo errpath review --base main crates/billing
-
-# One function as a Mermaid diagram
-cargo errpath diagram src/transfer.rs transfer
-
-# The analysis behind all of this, as versioned JSON
-cargo errpath ir src
+```rust
+pub fn place_order(cart: &Cart, card: &Card) -> Result<Receipt, OrderError> {
+    let total = price(cart)?;
+    if cart.has_coupon() {
+        validate_coupon(cart)?;
+    }
+    let payment = charge(card, total).map_err(OrderError::Payment)?;
+    let receipt = save_order(cart, &payment)?;
+    send_confirmation(&receipt)?;
+    Ok(receipt)
+}
 ```
 
-`review` reads the two refs from git, not your working tree, and starts from their merge base, so work merged to `main` after you branched isn't counted as yours. When it sees no change it prints nothing to stdout, and one line to stderr saying what it compared and what it couldn't analyse.
+```bash
+cargo errpath diagram src/checkout.rs place_order
+```
 
-## GitHub Action
+```mermaid
+flowchart LR
+  Start(["place_order"])
+  Done((Success))
+  S1["price"]
+  E2[/"PriceError"/]
+  D3{"if cart.has_coupon()"}
+  S4["validate_coupon"]
+  E5[/"CouponError"/]
+  S6["charge"]
+  E7[/"CardDeclined"/]
+  S8["save_order"]
+  E9[/"DbError"/]
+  S10["send_confirmation"]
+  E11[/"EmailError"/]
+  Start --> S1
+  S1 -->|err| E2
+  S1 -->|ok| D3
+  D3 -->|"yes"| S4
+  S4 -->|err| E5
+  S4 -->|ok| S6
+  D3 -->|"no"| S6
+  S6 -->|err| E7
+  S6 -->|ok| S8
+  S8 -->|err| E9
+  S8 -->|ok| S10
+  S10 -->|err| E11
+  S10 -->|ok| Done
+```
+
+Each `?` becomes a step with an exit to the error it returns. The coupon check only runs on one branch, and you can see it. Five ways to fail, one way to succeed.
+
+These examples assume the called functions' signatures are available in the same file, which is where names like `PriceError` and `CardDeclined` come from. Without a signature, a step shows the enclosing function's error instead.
+
+## A two-line PR that hides two problems
+
+```diff
+-    let total = price(cart)?;
++    let total = price(cart).expect("cart was priced");
+ ...
+-    send_confirmation(&receipt)?;
++    let _ = send_confirmation(&receipt);
+```
+
+It compiles without warnings and passes default Clippy. In review it reads as tidying up. `errpath` posts this on the PR:
+
+> ## Error path review: high risk
+>
+> 1 function changed, 2 new findings.
+>
+> ### New findings
+>
+> - `no-panic` `price.expect can panic` at `src/checkout.rs:2`
+> - `no-swallow` `let _ = drops the error from send_confirmation` at `src/checkout.rs:8`
+>
+> ### Changed error paths
+>
+> #### `checkout::place_order`
+>
+> - added panic path `price.expect`
+> - added dropped error from `send_confirmation`
+> - removed step `price` → `PriceError`
+> - removed step `send_confirmation` → `EmailError`
+
+The comment includes the function's new diagram. A pricing failure now panics, and a failed confirmation email vanishes:
+
+```mermaid
+flowchart LR
+  Start(["place_order"])
+  Done((Success))
+  P1{{"price.expect"}}
+  E2[/"panic"/]
+  D3{"if cart.has_coupon()"}
+  S4["validate_coupon"]
+  E5[/"CouponError"/]
+  S6["charge"]
+  E7[/"CardDeclined"/]
+  S8["save_order"]
+  E9[/"DbError"/]
+  W10{{"dropped: send_confirmation (let _ =)"}}
+  Start --> P1
+  P1 -->|err| E2
+  P1 -->|ok| D3
+  D3 -->|"yes"| S4
+  S4 -->|err| E5
+  S4 -->|ok| S6
+  D3 -->|"no"| S6
+  S6 -->|err| E7
+  S6 -->|ok| S8
+  S8 -->|err| E9
+  S8 -->|ok| W10
+  W10 --> Done
+```
+
+Maybe both changes are deliberate. Then the author says so in one comment (see [allowing a finding](#allowing-a-finding)), and reviewers see the reason.
+
+## Silent when nothing changed
+
+Rename `total` to `order_total`, reformat the file or add comments, and `errpath` prints nothing. A codebase with years of `unwrap`s stays quiet too: it reports only what the change introduced.
+
+## Get started
+
+On your machine, commit your work, then compare your branch with `main`:
+
+```bash
+cargo errpath review --base main
+```
+
+`review` reads both refs from git and ignores uncommitted edits.
+
+On every pull request, add `.github/workflows/errpath.yml`:
 
 ```yaml
 name: errpath
-
-on:
-  pull_request:
-
+on: pull_request
 permissions:
   contents: read
   pull-requests: write
-
 jobs:
   review:
     runs-on: ubuntu-latest
@@ -85,7 +157,267 @@ jobs:
       - uses: jagreehal/errpath@v0.1.0
 ```
 
-Every review goes in the job summary, and new findings are annotated in the Files changed tab. By default only moderate and high risk get a PR comment, and that one comment is updated as the PR changes. If a later push drops below the threshold, the comment is removed.
+You get one PR comment that updates as the branch changes, inline annotations on new findings, and a job summary. Low-risk changes skip the comment and appear only in the summary.
+
+## More shapes
+
+Every diagram below is unedited `cargo errpath diagram` output.
+
+### A retry loop
+
+The loop shows as a box. Two arms leave it, and the guarded arm goes round again.
+
+```rust
+fn fetch_with_retry(url: &str) -> Result<Body, FetchError> {
+    let mut attempts = 0;
+    loop {
+        match get(url) {
+            Ok(body) => return Ok(body),
+            Err(e) if attempts < 3 => attempts += 1,
+            Err(e) => return Err(FetchError::GaveUp(e)),
+        }
+    }
+}
+```
+
+```mermaid
+flowchart LR
+  Start(["fetch_with_retry"])
+  Done((Success))
+  subgraph G1["loop"]
+  H2(("repeat"))
+  D3{"match get(url)"}
+  E4[/"FetchError::GaveUp(e)"/]
+  end
+  Start --> H2
+  H2 --> D3
+  D3 -->|"Ok(body)"| Done
+  D3 -->|"Err(e)"| E4
+  D3 -->|"Err(e) if attempts < 3"| H2
+```
+
+### A `match` on a request
+
+Each arm gets its own path, and `Route::Health` has no way to fail.
+
+```rust
+fn handle(req: Request) -> Result<Response, ApiError> {
+    let user = authenticate(&req)?;
+    match req.route() {
+        Route::Orders => list_orders(&user),
+        Route::Refund(id) => {
+            let order = load_order(id)?;
+            refund(&order).map_err(ApiError::Refund)
+        }
+        Route::Health => Ok(Response::ok()),
+    }
+}
+```
+
+```mermaid
+flowchart LR
+  Start(["handle"])
+  Done((Success))
+  S1["authenticate"]
+  E2[/"AuthError"/]
+  D3{"match req.route()"}
+  S4["list_orders"]
+  E5[/"ApiError"/]
+  S6["load_order"]
+  E7[/"DbError"/]
+  S8["refund"]
+  E9[/"PaymentError"/]
+  Start --> S1
+  S1 -->|err| E2
+  S1 -->|ok| D3
+  D3 -->|"Route::Orders"| S4
+  S4 -->|err| E5
+  D3 -->|"Route::Refund(id)"| S6
+  S6 -->|err| E7
+  S6 -->|ok| S8
+  S8 -->|err| E9
+  S4 -->|ok| Done
+  S8 -->|ok| Done
+  D3 -->|"Route::Health"| Done
+```
+
+### Early returns
+
+`return Ok` skips the rest. `return Err` is an exit of its own.
+
+```rust
+fn import(file: &Path) -> Result<Summary, ImportError> {
+    let rows = read_csv(file)?;
+    if rows.is_empty() {
+        return Ok(Summary::empty());
+    }
+    let valid = validate(&rows)?;
+    if valid.len() < rows.len() {
+        return Err(ImportError::Invalid(rows.len() - valid.len()));
+    }
+    save_all(&valid)?;
+    Ok(Summary::new(valid.len()))
+}
+```
+
+```mermaid
+flowchart LR
+  Start(["import"])
+  Done((Success))
+  S1["read_csv"]
+  E2[/"CsvError"/]
+  D3{"if rows.is_empty()"}
+  S4["validate"]
+  E5[/"SchemaError"/]
+  D6{"if valid.len() < rows.len()"}
+  E7[/"ImportError::Invalid(rows.len() - val..."/]
+  S8["save_all"]
+  E9[/"DbError"/]
+  Start --> S1
+  S1 -->|err| E2
+  S1 -->|ok| D3
+  D3 -->|"yes"| Done
+  D3 -->|"no"| S4
+  S4 -->|err| E5
+  S4 -->|ok| D6
+  D6 -->|"yes"| E7
+  D6 -->|"no"| S8
+  S8 -->|err| E9
+  S8 -->|ok| Done
+```
+
+### Closures and async blocks
+
+The closure passed to `traced` is drawn as its own box, inside the function that calls it.
+
+```rust
+async fn sync_account(id: AccountId) -> Result<(), SyncError> {
+    let account = load(id).await?;
+    traced("sync", || async {
+        let remote = fetch_remote(&account).await?;
+        merge(&account, remote)?;
+        Ok(())
+    })
+    .await?;
+    notify(&account).await?;
+    Ok(())
+}
+```
+
+```mermaid
+flowchart LR
+  Start(["sync_account"])
+  Done((Success))
+  S1["load"]
+  E2[/"DbError"/]
+  subgraph G3["traced"]
+  S4["fetch_remote"]
+  E5[/"HttpError"/]
+  S6["merge"]
+  E7[/"ConflictError"/]
+  end
+  S8["traced"]
+  E9[/"→ SyncError"/]
+  S10["notify"]
+  E11[/"EmailError"/]
+  Start --> S1
+  S1 -->|err| E2
+  S1 -->|ok| S4
+  S4 -->|err| E5
+  S4 -->|ok| S6
+  S6 -->|err| E7
+  S6 -->|ok| S8
+  S8 -->|err| E9
+  S8 -->|ok| S10
+  S10 -->|err| E11
+  S10 -->|ok| Done
+```
+
+## What it flags
+
+| Risk | Change |
+| --- | --- |
+| **High** | An error is certainly dropped: `let _ = commit();`, `commit().ok();` |
+| **Moderate** | A new `unwrap`, `expect`, `panic!` or `todo!` |
+| | An error may be dropped, but the callee's type isn't visible: `let _ = tx.send(1);` |
+| | A step moved into or out of a branch or loop, or a condition changed |
+| | An error conversion changed: `map_err(Top::A)` to `map_err(Top::B)` |
+| | Exits reordered, a return type changed, or `break`/`continue` added or retargeted |
+| **Low** | A step, failure exit or early return added or removed |
+| | `.context("...")` text or `match` arms changed |
+
+Moved and renamed functions are matched up, so moving code doesn't count as new. Risk points you at the change. The code around it decides whether it matters.
+
+## Allowing a finding
+
+Some dropped errors are deliberate. Write the reason on the line above or at the end of the line:
+
+```rust
+// errpath: allow(no-swallow) a failed email must not fail the order
+let _ = send_confirmation(&receipt);
+```
+
+The reason is required, and every new allow still appears in the review, so nothing gets silenced unseen.
+
+## Good to know
+
+`errpath` reads syntax, which is why it needs no build. Every review states how much it analysed.
+
+<details>
+<summary>What syntax alone can't see</summary>
+
+- **Macros.** A `?` inside a macro call is counted but not placed. Functions wrapped entirely in a macro, like `cfg_rt! { .. }`, aren't analysed.
+- **Types.** Errors are named from signatures in the same file. On real crates that covers about a quarter of steps. The rest show the enclosing function's error, or "unknown error".
+- **Implicit conversions.** A change inside `impl From<A> for B` doesn't appear at the `?` that uses it.
+- **Data flow.** A loop with nothing fallible can set a variable that a later `if` fails on. The two aren't connected.
+- **Identical calls.** Steps are identified by callee, not arguments, so swapping two `read(r)?` calls that differ only in their arguments looks the same.
+- **Diverging calls.** A call to a `fn() -> !` isn't known to stop the path, and `while true {}` isn't treated as endless.
+- **Recovery.** `if let Err(e) = a() { .. }` handles an error without a step, so it isn't tracked as an exit.
+- **Test code.** `#[test]`, `#[cfg(test)]` and a package's `tests/`, `benches/` and `examples/` are skipped. Code behind `cfg(any(test, feature = "..."))` is analysed, because a feature can be on in production.
+
+These edits produce a report even though behaviour stays the same:
+
+- Renaming a variable that shadows a parameter, as in `let now = now.as_secs();`.
+- Renaming a variable captured by name in a string, as in `format!("{ca}")`.
+- Renaming a closure parameter used in a condition.
+- A trailing comma after a turbofish call, as in `f::<T>(x,)`.
+
+</details>
+
+<details>
+<summary>How it's tested</summary>
+
+A mutation test applies hundreds of small edits to real syntax. Edits to failure paths must be reported, and edits that leave them alone must stay silent. On 2,353 mutants from four popular crates, 2,350 got the right answer. The other 3 were renames of shadowing variables. Score your own code with:
+
+```bash
+MUTATE_PATH=path/to/src cargo test real_code -- --ignored --nocapture
+```
+
+Over the last 30 commits of three popular crates, it reported on 39 of 90: 15 low risk, 24 moderate, none high. With the default settings that's 24 PR comments.
+
+</details>
+
+## Reference
+
+<details>
+<summary>Commands</summary>
+
+```bash
+cargo errpath review --base main                         # markdown to stdout
+cargo errpath review --base main --head my-branch        # any two refs
+cargo errpath review --base main crates/billing          # only some paths
+cargo errpath review --base main --format json -o r.json # for tools
+cargo errpath review --base main --diagrams collapsed    # diagrams in <details>
+cargo errpath diagram src/checkout.rs place_order        # one function, Mermaid
+cargo errpath ir src                                     # the analysis, as JSON
+```
+
+`review` reads both refs from git, not your working tree, and starts from their merge base, so work merged to `main` after you branched doesn't count as yours.
+
+</details>
+
+<details>
+<summary>GitHub Action inputs and outputs</summary>
 
 | Input | Default | |
 | --- | --- | --- |
@@ -99,79 +431,18 @@ Every review goes in the job summary, and new findings are annotated in the File
 | `version` | the action's tag | `cargo-errpath` version to install |
 | `cli` | | A command to run instead of installing |
 
-It outputs `risk`, `changed` and `report`, the path of the JSON report.
+Outputs: `risk`, `changed`, and `report`, the path of the JSON report.
 
-A fork PR's token can't comment, so its review stays in the job summary and annotations. We'd leave `fail-on` at `never` until you've seen a few weeks of its output on your code.
+A fork PR's token can't comment, so its review stays in the job summary and annotations. Leave `fail-on` at `never` until you've read a few weeks of output on your code.
 
-## What it reports
+</details>
 
-Each function's exits are compared between the two refs. Moved and renamed functions are matched up, so moving code isn't reported as new.
+<details>
+<summary>JSON</summary>
 
-| Change | Risk |
-| --- | --- |
-| An error is certainly dropped (`let _ = commit();`, `commit().ok();`) | High |
-| A new panic path (`unwrap`, `expect`, `panic!`, `todo!`) | Moderate |
-| An error may be dropped, but the callee's type can't be seen (`let _ = tx.send(1);`) | Moderate |
-| A step moved in or out of a branch or loop, or a condition changed | Moderate |
-| An error conversion changed (`map_err(Top::A)` to `map_err(Top::B)`) | Moderate |
-| A declared return type changed | Moderate |
-| Exits reordered | Moderate |
-| `break`, `continue` or an endless `loop` added, removed or retargeted | Moderate |
-| A step, failure exit or early return added or removed | Low |
-| `.context("...")` text changed, or `match` arms changed | Low |
+`review --format json` gives `risk`, `changed`, `markdown`, `newFindings`, `new_allows`, `functions`, `coverage`, `notes` and more. `ir` gives the analysis itself. Both carry a `schema_version`.
 
-New functions and deleted functions don't produce a report on their own, unless a new one has a finding. They aren't a change to an existing failure path.
-
-Treat risk as a starting point. You decide whether a change matters from the code around it.
-
-## Allowing a finding
-
-Some dropped errors are deliberate. Say why, on the line above or at the end of the line:
-
-```rust
-// errpath: allow(no-swallow) receiver hung up during shutdown
-let _ = tx.send(1);
-
-let n = commit().unwrap(); // errpath: allow(no-panic) checked at startup
-```
-
-The reason is required. An allow comment with no reason, or naming an unknown rule, is ignored and reported as `bad-allow`. A review still shows every new allow comment, so a finding can't be silenced unseen, and removing one makes the finding new again.
-
-## Limits
-
-`errpath` reads syntax. Each result states how much it analysed, so read a silent review together with that coverage line.
-
-- **Macros.** A `?` inside a macro call is counted but not placed. Functions wrapped entirely in a macro, like `cfg_rt! { .. }`, aren't analysed at all.
-- **Types.** Errors are named from signatures in the same file. On real crates that covers about a quarter of steps. The rest show the enclosing function's error, or "unknown error".
-- **Implicit conversions.** A change inside `impl From<A> for B` doesn't appear at the `?` that uses it.
-- **Data flow.** A loop with nothing fallible can set a variable that a later `if` fails on. The two aren't connected.
-- **Identical calls.** Steps are identified by callee, not arguments, so swapping two `read(r)?` calls that differ only in their arguments looks the same.
-- **Diverging calls.** A call to a `fn() -> !` isn't known to stop the path. `while true {}` isn't treated as endless either.
-- **Recovery.** `if let Err(e) = a() { .. }` handles an error without a step, so it isn't tracked as an exit.
-- **Test code.** `#[test]`, `#[cfg(test)]` and code under a package's `tests/`, `benches/` and `examples/` are skipped. Code behind `cfg(any(test, feature = "..."))` is analysed, because a feature name doesn't prove it's test-only.
-
-These edits produce a report even though behaviour stays the same:
-
-- Renaming a variable that shadows a parameter, as in `let now = now.as_secs();`.
-- Renaming a variable captured by name in a string, as in `format!("{ca}")`.
-- A closure parameter renamed in a condition, rather than in an error conversion.
-- A trailing comma after a turbofish call, as in `f::<T>(x,)`.
-
-## How it's tested
-
-Besides unit tests, a mutation test applies hundreds of small edits to real syntax and checks each one. Edits to failure paths must be reported, and edits that leave them alone must stay silent. To score your own code:
-
-```bash
-MUTATE_PATH=path/to/src cargo test real_code -- --ignored --nocapture
-```
-
-On a sample of 2,353 mutants from four popular crates, 2,350 got the right answer. The other 3 are renames of shadowing variables. Mutants cover the kinds of edit we wrote operators for, so read that score as coverage of those edits.
-
-Replayed over the last 30 commits of three popular crates, it reported on 39 of 90 commits: 15 low risk, 24 moderate and none high. The default `comment-on` would post 24 PR comments for those 90 commits. We read the reports by hand and most showed real changes to failure paths. We haven't graded them formally.
-
-## JSON
-
-`cargo errpath review --format json` gives you `risk`, `changed`, `markdown`, `newFindings`, `new_allows`, `functions`, `coverage`, `notes` and more. `cargo errpath ir` gives the analysis itself. Both carry a `schema_version`.
+</details>
 
 ## Agent skill
 
