@@ -85,6 +85,7 @@ fn review(args: &[&str]) {
         eprintln!("{}", review.summary);
     }
     let text = match format {
+        // errpath: allow(no-panic) Review is plain derived data, which always serializes
         "json" => serde_json::to_string_pretty(&review).expect("review serializes") + "\n",
         _ => review.markdown.clone(),
     };
