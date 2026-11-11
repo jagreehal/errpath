@@ -8,6 +8,7 @@ readme = "README.md"
 repository = "https://github.com/jagreehal/errpath"
 keywords = ["cargo", "review", "error-handling", "static-analysis", "panic"]
 categories = ["development-tools::cargo-plugins", "development-tools"]
+exclude = ["docs/"]
 
 [dependencies]
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }

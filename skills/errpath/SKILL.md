@@ -59,7 +59,7 @@ cargo errpath diagram src/transfer.rs transfer   # Mermaid
 cargo errpath ir src                             # versioned JSON
 ```
 
-Each `?` becomes a step with an exit to its error. Error names come from callee signatures in the same file, and other steps show the enclosing function's error. Review comments include the changed function's diagram.
+Each `?` becomes a step with an exit to its error. Error names come from callee signatures anywhere in the same crate, and other steps show the enclosing function's error. Review comments include the changed function's diagram.
 
 ## GitHub Action
 
@@ -79,4 +79,4 @@ Keep `fail-on` at `never` until the team has read a few weeks of output. `commen
 
 ## Limits
 
-`errpath` sees syntax only: code inside macros, types from other files and `impl From` bodies stay out of view. Pair it with tests and Clippy. The README lists each limit.
+`errpath` sees syntax only: code inside macros, the receiver type of a method call and `impl From` bodies stay out of view. Pair it with tests and Clippy. The README lists each limit.
