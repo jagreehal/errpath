@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0
+
+- Each `?` now takes its error name from the called function's signature anywhere in the same crate, so more steps show the callee's own error. A library and its binaries resolve as separate crates.
+- The GitHub Action setup examples use `actions/checkout@v7`.
+- The README shows real `errpath` diagrams as images, so they appear in GitHub Mobile. It also has animated failure paths, a worked pull request review, examples for loops, `match`, early returns and async closures, and a linked interactive page for stepping through the diagrams.
+
 ## 0.1.0
 
 First release.
