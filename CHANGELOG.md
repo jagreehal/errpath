@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - Errors handled in place, such as `if let Err(e) = a() { log(e) }`, appear in diagrams as handled steps. Reviews rate one added, removed, or changed to catch a different error as moderate risk.
 - A returned `match` that hands its error back (`err => err`) shows as a step with an error exit. A guard on that arm forks the diagram, so reviews catch a changed guard.
