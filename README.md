@@ -4,11 +4,15 @@
 
 `errpath` is a CLI and GitHub Action that highlights new panic paths, dropped errors and changes to error propagation. Reviewers get a focused before-and-after report, with diagrams showing where failures leave each function.
 
-It reads Rust source directly. No build required, and nothing to add to your project.
+It reads Rust source. No build required, and nothing to add to your project.
 
 ```bash
 cargo install cargo-errpath
 ```
+
+<p align="center">
+  <img src="docs/place-order.svg" width="100%" alt="errpath diagram of place_order. Each step (price, a coupon check, charge, save_order, send_confirmation) has an exit to its error. The animation follows a declined card from the start to CardDeclined.">
+</p>
 
 ## Your function, as a diagram
 
@@ -61,7 +65,7 @@ flowchart LR
 
 Each `?` becomes a step with an exit to the error it returns. The coupon check only runs on one branch, and you can see it. Five ways to fail, one way to succeed.
 
-These examples assume the called functions' signatures are available in the same file, which is where names like `PriceError` and `CardDeclined` come from. Without a signature, a step shows the enclosing function's error instead.
+Names like `PriceError` and `CardDeclined` come from the called functions' signatures, which `errpath` finds anywhere in the same crate. Without a signature, a step shows the enclosing function's error.
 
 ## A two-line PR that hides two problems
 
@@ -93,7 +97,14 @@ It compiles without warnings and passes default Clippy. In review it reads as ti
 > - removed step `price` → `PriceError`
 > - removed step `send_confirmation` → `EmailError`
 
-The comment includes the function's new diagram. A pricing failure now panics, and a failed confirmation email vanishes:
+The comment includes the function's new diagram. A pricing failure now panics, and a failed confirmation email still reaches Success:
+
+<p align="center">
+  <img src="docs/place-order-after-pr.svg" width="100%" alt="errpath diagram of place_order after the PR. price.expect now exits to a panic, and the path runs through a dropped send_confirmation to Success.">
+</p>
+
+<details>
+<summary>The Mermaid source errpath posts</summary>
 
 ```mermaid
 flowchart LR
@@ -122,6 +133,8 @@ flowchart LR
   S8 -->|ok| W10
   W10 --> Done
 ```
+
+</details>
 
 Maybe both changes are deliberate. Then the author says so in one comment (see [allowing a finding](#allowing-a-finding)), and reviewers see the reason.
 
@@ -367,7 +380,7 @@ The reason is required, and every new allow still appears in the review, so noth
 <summary>What syntax alone can't see</summary>
 
 - **Macros.** A `?` inside a macro call is counted but not placed. Functions wrapped entirely in a macro, like `cfg_rt! { .. }`, aren't analysed.
-- **Types.** Errors are named from signatures in the same file. On real crates that covers about a quarter of steps. The rest show the enclosing function's error, or "unknown error".
+- **Types.** `errpath` names each error from the called function's signature, matched by name across the crate. A binary and its package's library count as separate crates, as `rustc` builds them. On real crates about half of steps get a named error. The rest show the enclosing function's error, or "unknown error". Names are matched without `use` paths, so a crate fn can claim a call to a dependency's fn of the same name. A method call like `x.load()` matches within its own file, since syntax can't tell the type of `x`.
 - **Implicit conversions.** A change inside `impl From<A> for B` doesn't appear at the `?` that uses it.
 - **Data flow.** A loop with nothing fallible can set a variable that a later `if` fails on. The two aren't connected.
 - **Identical calls.** Steps are identified by callee, not arguments, so swapping two `read(r)?` calls that differ only in their arguments looks the same.

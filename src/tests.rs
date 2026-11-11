@@ -482,6 +482,189 @@ fn out_of_line_test_modules_are_skipped() {
 }
 
 #[test]
+fn callee_errors_come_from_other_files_in_the_crate() {
+    let mut r = Report::new();
+    r.add_source(
+        "src/db.rs",
+        "db",
+        "pub fn get_user() -> Result<User, NotFound> { todo!() }
+         pub struct Pool;
+         impl Pool { pub fn open() -> Result<Pool, PoolError> { todo!() } }
+         impl Repo { fn load(&self) -> Result<u8, LoadError> { todo!() } }",
+    );
+    r.add_source(
+        "src/tests.rs",
+        "tests",
+        "fn send() -> Result<(), FromTests> { todo!() }",
+    );
+    r.add_source(
+        "src/lib.rs",
+        "",
+        "#[cfg(test)] mod tests;
+         fn a() -> Result<(), Top> { get_user()?; db::get_user()?; Pool::open()?; x.load()?; send()?; Ok(()) }
+         impl Repo { fn b(&self) -> Result<(), Top> { self.load()?; Ok(()) } }",
+    );
+    let r = r.finish();
+    let errors = |id: &str| -> Vec<_> {
+        let f = r.functions.iter().find(|f| f.id == id).unwrap();
+        f.nodes
+            .iter()
+            .filter_map(|n| match n {
+                Node::Step { error, source, .. } => Some((error.clone().unwrap(), *source)),
+                _ => None,
+            })
+            .collect()
+    };
+    let callee = |e: &str| (e.to_string(), ErrorSource::Callee);
+    let enclosing = ("Top".to_string(), ErrorSource::Enclosing);
+    // A bare `x.load()` could be any type's, and test code isn't indexed.
+    assert_eq!(
+        errors("a"),
+        [
+            callee("NotFound"),
+            callee("NotFound"),
+            callee("PoolError"),
+            enclosing.clone(),
+            enclosing
+        ]
+    );
+    assert_eq!(errors("Repo::b"), [callee("LoadError")]);
+}
+
+#[test]
+fn callee_errors_stay_within_their_package() {
+    let mut r = Report::new();
+    r.add_source(
+        "a/src/lib.rs",
+        "a",
+        "pub fn load() -> Result<(), AError> { todo!() }",
+    );
+    r.add_source(
+        "b/src/util.rs",
+        "b::util",
+        "pub fn save() -> Result<(), BError> { todo!() }",
+    );
+    r.add_source(
+        "b/src/lib.rs",
+        "b",
+        "fn f() -> Result<(), Top> { load()?; save()?; Ok(()) }",
+    );
+    let r = r.finish();
+    let f = r.functions.iter().find(|f| f.id == "b::f").unwrap();
+    let errors: Vec<_> = f
+        .nodes
+        .iter()
+        .filter_map(|n| match n {
+            Node::Step { error, .. } => error.as_deref(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors, ["Top", "BError"]);
+}
+
+#[test]
+fn callee_errors_follow_the_module_tree_of_each_crate() {
+    let mut r = Report::new();
+    let files = [
+        (
+            "src/lib.rs",
+            "mod shared; mod private; pub fn run() -> Result<(), LibError> { todo!() }
+             fn in_lib() -> Result<(), Top> { parse()?; load()?; tool()?; Ok(()) }",
+        ),
+        (
+            "src/shared.rs",
+            "pub fn load() -> Result<(), SharedError> { todo!() }",
+        ),
+        (
+            "src/private.rs",
+            "pub fn hidden() -> Result<(), PrivateError> { todo!() }",
+        ),
+        (
+            "src/main.rs",
+            "mod cli; mod shared;
+             fn in_bin() -> Result<(), Top> { run()?; parse()?; shared::load()?; hidden()?; Ok(()) }",
+        ),
+        (
+            "src/cli.rs",
+            "pub fn parse() -> Result<(), CliError> { todo!() }",
+        ),
+        (
+            "src/bin/other.rs",
+            "fn in_other() -> Result<(), Top> { parse()?; Ok(()) }",
+        ),
+        // `[lib] path = "lib.rs"`: a package without `src/`.
+        (
+            "tools/lib.rs",
+            "mod y; pub fn tool() -> Result<(), ToolError> { todo!() }",
+        ),
+        (
+            "tools/y.rs",
+            "fn in_tools() -> Result<(), Top> { tool()?; Ok(()) }",
+        ),
+    ];
+    for (file, src) in files {
+        r.add_source(file, &module_of(Path::new(file)), src);
+    }
+    let r = r.finish();
+    let errors = |name: &str| -> Vec<_> {
+        let f = r.functions.iter().find(|f| f.name == name).unwrap();
+        f.nodes
+            .iter()
+            .filter_map(|n| match n {
+                Node::Step { error, .. } => error.clone(),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(errors("in_lib"), ["Top", "SharedError", "Top"]);
+    // `shared` is compiled into both crates, `private` only into the lib.
+    assert_eq!(errors("in_bin"), ["Top", "CliError", "SharedError", "Top"]);
+    assert_eq!(errors("in_other"), ["Top"]);
+    assert_eq!(errors("in_tools"), ["ToolError"]);
+}
+
+#[test]
+fn a_file_in_two_crates_resolves_only_what_they_agree_on() {
+    let mut r = Report::new();
+    let files = [
+        (
+            "src/lib.rs",
+            "mod shared; fn load() -> Result<(), LibError> { todo!() }
+             fn same() -> Result<(), SameError> { todo!() }",
+        ),
+        (
+            "src/main.rs",
+            "mod shared; fn load() -> Result<(), BinError> { todo!() }
+             fn same() -> Result<(), SameError> { todo!() }",
+        ),
+        (
+            "src/shared.rs",
+            "fn f() -> Result<(), Top> { super::load()?; super::same()?; Ok(()) }",
+        ),
+    ];
+    for (file, src) in files {
+        r.add_source(file, &module_of(Path::new(file)), src);
+    }
+    let r = r.finish();
+    let f = r.functions.iter().find(|f| f.id == "shared::f").unwrap();
+    let errors: Vec<_> = f
+        .nodes
+        .iter()
+        .filter_map(|n| match n {
+            Node::Step { error, source, .. } => Some((error.clone().unwrap(), *source)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            ("Top".to_string(), ErrorSource::Enclosing),
+            ("SameError".to_string(), ErrorSource::Callee)
+        ]
+    );
+}
+
+#[test]
 fn macros_wrapping_items_are_counted_once() {
     let r = analyse(
         "ffi_fn! { fn a() { b()?; c()?; } }

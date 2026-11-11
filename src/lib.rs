@@ -26,7 +26,7 @@ const ALLOWABLE: &[&str] = &[NO_PANIC, NO_SWALLOW];
 #[derive(Debug, PartialEq, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorSource {
-    /// The called function's own signature, found in the same file.
+    /// The called function's own signature, found in the same crate.
     Callee,
     /// The enclosing function's error type: what `?` converts into.
     Enclosing,
@@ -184,6 +184,9 @@ pub struct Report {
     pub support_files_skipped: usize,
     #[serde(skip)]
     test_files: HashSet<String>,
+    /// (file, module, source), walked in `finish` once every signature is known.
+    #[serde(skip)]
+    pending: Vec<(String, String, String)>,
 }
 
 fn line(s: &impl Spanned) -> usize {
@@ -235,6 +238,8 @@ struct Collector<'ast> {
     owner: Option<String>,
     /// `#[cfg(test)] mod x;`: the code lives in another file.
     test_mods: Vec<String>,
+    /// Top-level `mod x;`: files that join this one's crate.
+    mods: Vec<String>,
     /// `?` in macros outside any fn, e.g. `ffi_fn! { fn f() { a()?; } }`.
     item_macro_try: usize,
     fn_depth: usize,
@@ -286,6 +291,10 @@ impl<'ast> Visit<'ast> for Collector<'ast> {
 
     fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
         if !is_test(&m.attrs) {
+            // `mod_files` maps top-level `mod x;` declarations to files.
+            if m.content.is_none() && self.path.is_empty() {
+                self.mods.push(m.ident.to_string());
+            }
             self.within(m.ident.to_string(), None, |c| visit::visit_item_mod(c, m));
         } else if m.content.is_none() {
             self.test_mods.push(m.ident.to_string());
@@ -382,32 +391,66 @@ struct IndexEntry {
     owner: Option<String>,
     name: String,
     returns: Returns,
+    /// Module path of the file plus any inline `mod`s, e.g. `app::db`.
+    module: String,
 }
 
-/// Every fn in one file.
-// File-scoped and matched by name, so a unique local `get` also claims
-// `other_type.get()`. Real type information would separate them.
-struct Index(Vec<IndexEntry>);
+/// Signatures from one file, backed by every crate the file is compiled into.
+// Lookups match by name; `use` paths and type information would narrow them.
+struct Index<'a> {
+    file: Vec<IndexEntry>,
+    /// Every crate the file is compiled into. Matches from all of them are
+    /// pooled, so crates that disagree leave the callee unknown.
+    krates: Vec<&'a [IndexEntry]>,
+}
 
-impl Index {
+impl Index<'_> {
     /// The callee's return type, or `None` when it's unknown or ambiguous.
     fn resolve(&self, c: &Callee, current: Option<&str>) -> Option<&Returns> {
         let owner = c
             .owner
             .as_deref()
             .map(|o| if o == "Self" { current.unwrap_or(o) } else { o });
-        let named = || self.0.iter().filter(|e| e.name == c.name);
-        let picked: Vec<_> = match owner {
+        let mut picked = self.in_file(c, owner);
+        if picked.is_empty() {
+            picked = self.in_crate(c, owner);
+        }
+        let first = &picked.first()?.returns;
+        picked.iter().all(|e| e.returns == *first).then_some(first)
+    }
+
+    fn in_file(&self, c: &Callee, owner: Option<&str>) -> Vec<&IndexEntry> {
+        let named = || self.file.iter().filter(|e| e.name == c.name);
+        match owner {
             Some(o) if named().any(|e| e.owner.as_deref() == Some(o)) => {
                 named().filter(|e| e.owner.as_deref() == Some(o)).collect()
             }
-            // A type we can't see: a local `new` says nothing about `Foreign::new`.
-            Some(o) if !c.method && o.starts_with(char::is_uppercase) => return None,
+            // A type defined elsewhere: a local `new` says nothing about `Other::new`.
+            Some(o) if !c.method && o.starts_with(char::is_uppercase) => vec![],
             _ if c.method => named().filter(|e| e.owner.is_some()).collect(),
             _ => named().filter(|e| e.owner.is_none()).collect(),
-        };
-        let first = &picked.first()?.returns;
-        picked.iter().all(|e| e.returns == *first).then_some(first)
+        }
+    }
+
+    /// Stricter than `in_file`: a bare `x.get()` could be any type's `get`.
+    fn in_crate(&self, c: &Callee, owner: Option<&str>) -> Vec<&IndexEntry> {
+        let named = self
+            .krates
+            .iter()
+            .flat_map(|k| k.iter())
+            .filter(|e| e.name == c.name);
+        match owner {
+            Some(o) if o.starts_with(char::is_uppercase) => {
+                named.filter(|e| e.owner.as_deref() == Some(o)).collect()
+            }
+            _ if c.method => vec![],
+            Some("crate" | "self" | "super") | None => {
+                named.filter(|e| e.owner.is_none()).collect()
+            }
+            Some(m) => named
+                .filter(|e| e.owner.is_none() && e.module.rsplit("::").next() == Some(m))
+                .collect(),
+        }
     }
 }
 
@@ -813,7 +856,7 @@ fn parse_allows(src: &str) -> (Vec<Allow>, Vec<(usize, String)>) {
 }
 
 struct Walker<'a> {
-    index: &'a Index,
+    index: &'a Index<'a>,
     allows: &'a [Allow],
     owner: Option<&'a str>,
     nodes: Vec<Node>,
@@ -1373,31 +1416,30 @@ impl Report {
             parse_failures: vec![],
             support_files_skipped: 0,
             test_files: HashSet::new(),
+            pending: vec![],
         }
     }
 
     pub(crate) fn add_source(&mut self, file: &str, module: &str, src: &str) {
-        let parsed = match syn::parse_file(src) {
-            Ok(p) => p,
-            Err(e) => {
-                self.parse_failures.push(ParseFailure {
-                    file: file.into(),
-                    message: e.to_string(),
-                });
-                return;
-            }
+        self.pending.push((file.into(), module.into(), src.into()));
+    }
+
+    fn walk_file(
+        &mut self,
+        file: &str,
+        module: &str,
+        src: &str,
+        collector: &Collector,
+        krates: Vec<&[IndexEntry]>,
+    ) {
+        let index = Index {
+            file: collector
+                .out
+                .iter()
+                .map(|f| index_entry(module, f))
+                .collect(),
+            krates,
         };
-        let mut collector = Collector::default();
-        collector.visit_file(&parsed);
-        self.coverage.item_macro_try += collector.item_macro_try;
-        self.test_files
-            .extend(collector.test_mods.iter().flat_map(|m| mod_files(file, m)));
-        let entry = |f: &RawFn| IndexEntry {
-            owner: f.owner.clone(),
-            name: f.sig.ident.to_string(),
-            returns: returns(&f.sig.output),
-        };
-        let index = Index(collector.out.iter().map(entry).collect());
         let (allows, bad) = parse_allows(src);
         for f in &collector.out {
             let ret = returns(&f.sig.output);
@@ -1459,6 +1501,53 @@ impl Report {
 
     /// `#[cfg(unix)]` / `#[cfg(windows)]` twins share a path: number the repeats.
     pub(crate) fn finish(mut self) -> Self {
+        let pending = std::mem::take(&mut self.pending);
+        let mut parsed = vec![];
+        for (file, module, src) in &pending {
+            match syn::parse_file(src) {
+                Ok(p) => parsed.push((file, module, src, p)),
+                Err(e) => self.parse_failures.push(ParseFailure {
+                    file: file.clone(),
+                    message: e.to_string(),
+                }),
+            }
+        }
+        let collectors: Vec<Collector> = parsed
+            .iter()
+            .map(|(.., p)| {
+                let mut c = Collector::default();
+                c.visit_file(p);
+                c
+            })
+            .collect();
+        for ((file, ..), c) in parsed.iter().zip(&collectors) {
+            self.coverage.item_macro_try += c.item_macro_try;
+            self.test_files
+                .extend(c.test_mods.iter().flat_map(|m| mod_files(file, m)));
+        }
+        // Each crate gets its own index, matching rustc's name scope.
+        let mods: HashMap<&str, &[String]> = parsed
+            .iter()
+            .zip(&collectors)
+            .map(|((file, ..), c)| (file.as_str(), &c.mods[..]))
+            .collect();
+        let krate_of = crate_roots(&mods);
+        let mut crates: HashMap<&str, Vec<IndexEntry>> = HashMap::new();
+        for ((file, module, ..), c) in parsed.iter().zip(&collectors) {
+            if !self.test_files.contains(*file) {
+                let entries = c.out.iter().map(|f| index_entry(module, f));
+                for krate in &krate_of[file.as_str()] {
+                    crates.entry(krate).or_default().extend(entries.clone());
+                }
+            }
+        }
+        for ((file, module, src, _), c) in parsed.iter().zip(&collectors) {
+            let krates = krate_of[file.as_str()]
+                .iter()
+                .filter_map(|k| crates.get(k.as_str()).map(Vec::as_slice))
+                .collect();
+            self.walk_file(file, module, src, c, krates);
+        }
         let test_files = std::mem::take(&mut self.test_files);
         self.functions.retain(|f| !test_files.contains(&f.file));
         self.findings.retain(|f| !test_files.contains(&f.file));
@@ -1482,6 +1571,20 @@ impl Report {
     }
 }
 
+fn index_entry(module: &str, f: &RawFn) -> IndexEntry {
+    let module = std::iter::once(module)
+        .chain(f.path.iter().map(String::as_str))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("::");
+    IndexEntry {
+        owner: f.owner.clone(),
+        name: f.sig.ident.to_string(),
+        returns: returns(&f.sig.output),
+        module,
+    }
+}
+
 /// Where `mod name;` declared in `file` can live.
 fn mod_files(file: &str, name: &str) -> [String; 2] {
     let path = Path::new(file);
@@ -1497,6 +1600,73 @@ fn mod_files(file: &str, name: &str) -> [String; 2] {
         dir.join(name).join("mod.rs"),
     ]
     .map(|p| p.display().to_string())
+}
+
+/// Each file's crates, named by their root files. Crates grow from their roots
+/// along `mod x;`, as rustc builds them: `src/lib.rs`, then `src/main.rs` and
+/// `src/bin/*`, then any other `lib.rs`/`main.rs` nothing declares, which is
+/// where a manifest's custom `path` usually points. A file no root reaches
+/// (`#[path]`, a `mod` inside a macro) joins its package's lib, if it has one.
+/// `mod shared;` in both lib.rs and main.rs puts shared.rs in both crates.
+// Roots come from file names, so the analysis needs no Cargo.toml.
+fn crate_roots<'f>(mods: &HashMap<&'f str, &[String]>) -> HashMap<&'f str, Vec<String>> {
+    let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+    let rank = |file: &str| {
+        let p = Path::new(file);
+        let up = |n: usize| p.ancestors().nth(n).and_then(name);
+        let (me, dir) = (up(0), up(1));
+        let src = Some("src".to_string());
+        match (me.as_deref(), dir.as_deref()) {
+            (Some("lib.rs"), _) if up(1) == src => Some(0),
+            (Some("main.rs"), _) if up(1) == src => Some(1),
+            (_, Some("bin")) if up(2) == src => Some(1),
+            (Some("main.rs"), _) if up(2).as_deref() == Some("bin") && up(3) == src => Some(1),
+            (Some("lib.rs" | "main.rs"), _) => Some(2),
+            _ => None,
+        }
+    };
+    let mut roots: Vec<_> = mods.keys().filter_map(|f| Some((rank(f)?, *f))).collect();
+    roots.sort();
+    let mut out: HashMap<&str, Vec<String>> = HashMap::new();
+    for (_, root) in roots {
+        if out.contains_key(root) {
+            continue; // a `lib.rs` some crate declares as a module
+        }
+        let mut todo = vec![root.to_string()];
+        let mut seen = HashSet::new();
+        while let Some(f) = todo.pop() {
+            let Some((&file, children)) = mods.get_key_value(f.as_str()) else {
+                continue;
+            };
+            if seen.insert(file) {
+                out.entry(file).or_default().push(root.to_string());
+                todo.extend(children.iter().flat_map(|m| mod_files(file, m)));
+            }
+        }
+    }
+    for &file in mods.keys() {
+        if !out.contains_key(file) {
+            let lib = crate_of(file).join("src/lib.rs").display().to_string();
+            let krate = if mods.contains_key(lib.as_str()) {
+                lib
+            } else {
+                crate_of(file).display().to_string()
+            };
+            out.insert(file, vec![krate]);
+        }
+    }
+    out
+}
+
+/// `a/src/net/tcp.rs` -> `a`: the package a file belongs to, by its last `src`
+/// directory. A file outside any `src` belongs to its own directory.
+fn crate_of(file: &str) -> &Path {
+    let path = Path::new(file);
+    path.ancestors()
+        .find(|a| a.file_name().is_some_and(|n| n == "src"))
+        .and_then(Path::parent)
+        .or(path.parent())
+        .unwrap_or(Path::new(""))
 }
 
 /// `src/net/mod.rs` -> `net`, `src/net/tcp.rs` -> `net::tcp`, `src/lib.rs` -> ``.
