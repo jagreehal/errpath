@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>errpath: step through a function's error paths</title>
+<meta name="description" content="Click through the error paths errpath draws for a Rust function, before and after a pull request.">
+<script src="https://cdn.jsdelivr.net/npm/mermaid-flow-player@2.2.0/mermaid-flow-player.element.js"></script>
+<style>
+  :root { color-scheme: light dark; --fg: #1f2328; --muted: #59636e; --bg: #fff; --rule: #d1d9e0; --code: #f6f8fa; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #f0f6fc; --muted: #9198a1; --bg: #0d1117; --rule: #3d444d; --code: #151b23; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 40px 20px 64px; }
+  h1 { font-size: 2rem; margin: 0 0 8px; }
+  h2 { font-size: 1.25rem; margin: 48px 0 8px; padding-top: 24px; border-top: 1px solid var(--rule); }
+  p { margin: 0 0 12px; max-width: 70ch; }
+  .lede { color: var(--muted); font-size: 1.1rem; }
+  code { font: 0.9em ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--code); padding: 0.15em 0.35em; border-radius: 4px; }
+  pre { background: var(--code); padding: 12px 16px; border-radius: 6px; overflow-x: auto; }
+  pre code { background: none; padding: 0; }
+  mermaid-flow-player { display: block; margin: 16px 0 8px; overflow-x: auto; }
+  .hint { color: var(--muted); font-size: 0.9rem; }
+  a { color: #0969da; }
+  @media (prefers-color-scheme: dark) { a { color: #4493f8; } }
+  footer { margin-top: 48px; color: var(--muted); font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>errpath</h1>
+  <p class="lede">Step through the error paths <code>errpath</code> draws for a Rust function. Start at the top, then click a highlighted step to choose where the function goes next. On a phone, tap the expand button to view a diagram full screen.</p>
+
+  <h2>Before: <code>place_order</code></h2>
+  <p>Each <code>?</code> is a step with two ways out: <code>ok</code> carries on, <code>err</code> leaves with the error it returns. Follow a path to <code>CardDeclined</code>, or all the way to Success.</p>
+<mermaid-flow-player mode="interactive" controls>
+flowchart LR
+  Start(["place_order"])
+  Done((Success))
+  S1["price"]
+  E2[/"PriceError"/]
+  D3{"if cart.has_coupon()"}
+  S4["validate_coupon"]
+  E5[/"CouponError"/]
+  S6["charge"]
+  E7[/"CardDeclined"/]
+  S8["save_order"]
+  E9[/"DbError"/]
+  S10["send_confirmation"]
+  E11[/"EmailError"/]
+  Start --> S1
+  S1 -->|err| E2
+  S1 -->|ok| D3
+  D3 -->|"yes"| S4
+  S4 -->|err| E5
+  S4 -->|ok| S6
+  D3 -->|"no"| S6
+  S6 -->|err| E7
+  S6 -->|ok| S8
+  S8 -->|err| E9
+  S8 -->|ok| S10
+  S10 -->|err| E11
+  S10 -->|ok| Done
+</mermaid-flow-player>
+  <p class="hint">Produced by <code>cargo errpath diagram src/checkout.rs place_order</code>.</p>
+
+  <h2>After a two-line pull request</h2>
+  <p>The PR swaps <code>price(cart)?</code> for <code>.expect(..)</code> and drops the result of <code>send_confirmation</code>:</p>
+<pre><code>-    let total = price(cart)?;
++    let total = price(cart).expect("cart was priced");
+ ...
+-    send_confirmation(&amp;receipt)?;
++    let _ = send_confirmation(&amp;receipt);</code></pre>
+  <p>Follow <code>price.expect</code> to a panic, then take the <code>ok</code> path and watch a failed email reach Success without a trace.</p>
+<mermaid-flow-player mode="interactive" controls>
+flowchart LR
+  Start(["place_order"])
+  Done((Success))
+  P1{{"price.expect"}}
+  E2[/"panic"/]
+  D3{"if cart.has_coupon()"}
+  S4["validate_coupon"]
+  E5[/"CouponError"/]
+  S6["charge"]
+  E7[/"CardDeclined"/]
+  S8["save_order"]
+  E9[/"DbError"/]
+  W10{{"dropped: send_confirmation (let _ =)"}}
+  Start --> P1
+  P1 -->|err| E2
+  P1 -->|ok| D3
+  D3 -->|"yes"| S4
+  S4 -->|err| E5
+  S4 -->|ok| S6
+  D3 -->|"no"| S6
+  S6 -->|err| E7
+  S6 -->|ok| S8
+  S8 -->|err| E9
+  S8 -->|ok| W10
+  W10 --> Done
+</mermaid-flow-player>
+  <p class="hint"><code>errpath</code> posts this diagram on the pull request, with the new findings above it.</p>
+
+  <footer>
+    <p><a href="https://github.com/jagreehal/errpath">errpath on GitHub</a> · <code>cargo install cargo-errpath</code></p>
+  </footer>
+</main>
+</body>
+</html>
