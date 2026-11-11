@@ -34,10 +34,10 @@ In JSON, read `risk`, `changed`, `newFindings`, `new_allows`, `functions`, `cove
 | Rule | Meaning | Action |
 | --- | --- | --- |
 | `no-panic` | The change added a panic path | Return the error, or allow it with the invariant that holds |
-| `no-swallow` | The change dropped an error | Handle or propagate it, or allow it with the reason |
+| `no-swallow` | The change dropped an error | Propagate it with `?`, or handle it with `if let Err(e) = ..` when the caller shouldn't fail. Otherwise allow it with the reason |
 | `bad-allow` | An allow comment has no reason or an unknown rule | Fix the comment |
 
-Treat risk as a prompt to read the surrounding code. High means an error is certainly dropped. Moderate covers new panics, possible drops, moved steps, and changed conversions, return types, order or jumps. Low covers added or removed steps and exits, `.context` text and `match` arms.
+Treat risk as a prompt to read the surrounding code. High means an error is certainly dropped. Moderate covers new panics, possible drops, moved steps, errors handled in place (`if let Err(e) = a() { log(e) }`), and changed conversions, return types, order or jumps. Low covers added or removed steps and exits, `.context` text and `match` arms.
 
 ## Allow a finding
 
@@ -59,7 +59,7 @@ cargo errpath diagram src/transfer.rs transfer   # Mermaid
 cargo errpath ir src                             # versioned JSON
 ```
 
-Each `?` becomes a step with an exit to its error. Error names come from callee signatures anywhere in the same crate, and other steps show the enclosing function's error. Review comments include the changed function's diagram.
+Each `?` becomes a step with an exit to its error. An error handled in place, such as `if let Err(e) = a() { log(e) }`, becomes a handled step that carries on. Error names come from callee signatures anywhere in the same crate, and other steps show the enclosing function's error. Review comments include the changed function's diagram.
 
 ## GitHub Action
 
