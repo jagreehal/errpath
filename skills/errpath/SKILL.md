@@ -69,7 +69,7 @@ permissions:
   pull-requests: write
 
 steps:
-  - uses: actions/checkout@v6
+  - uses: actions/checkout@v7
     with:
       fetch-depth: 0
   - uses: jagreehal/errpath@v0.1.0
