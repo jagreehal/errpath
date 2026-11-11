@@ -14,6 +14,8 @@ cargo install cargo-errpath
   <img src="docs/place-order.svg" width="100%" alt="errpath diagram of place_order. Each step (price, a coupon check, charge, save_order, send_confirmation) has an exit to its error. The animation follows a declined card from the start to CardDeclined.">
 </p>
 
+[Step through these diagrams yourself](https://jagreehal.github.io/errpath/), choosing which path each function takes.
+
 ## Your function, as a diagram
 
 ```rust
