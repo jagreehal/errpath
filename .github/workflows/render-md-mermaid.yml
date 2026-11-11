@@ -1,0 +1,21 @@
+name: render-md-mermaid
+
+# Renders each README diagram to a PNG, so GitHub Mobile shows it too.
+on:
+  push:
+    paths:
+      - "README.md"
+
+permissions:
+  contents: write
+
+jobs:
+  render-md-mermaid:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: nielsvaneck/render-md-mermaid@v3
+      - uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          file_pattern: "docs/diagrams/*.png"
+          commit_message: "Render README diagrams"

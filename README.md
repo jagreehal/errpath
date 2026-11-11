@@ -33,6 +33,11 @@ pub fn place_order(cart: &Cart, card: &Card) -> Result<Receipt, OrderError> {
 cargo errpath diagram src/checkout.rs place_order
 ```
 
+![errpath diagram of place_order: five steps, each with an exit to its error, and a coupon branch](docs/diagrams/place-order.png)
+
+<details>
+<summary>Mermaid source</summary>
+
 ```mermaid
 flowchart LR
   Start(["place_order"])
@@ -62,6 +67,8 @@ flowchart LR
   S10 -->|err| E11
   S10 -->|ok| Done
 ```
+
+</details>
 
 Each `?` becomes a step with an exit to the error it returns. The coupon check only runs on one branch, and you can see it. Five ways to fail, one way to succeed.
 
@@ -193,6 +200,11 @@ fn fetch_with_retry(url: &str) -> Result<Body, FetchError> {
 }
 ```
 
+![errpath diagram of a retry loop](docs/diagrams/retry-loop.png)
+
+<details>
+<summary>Mermaid source</summary>
+
 ```mermaid
 flowchart LR
   Start(["fetch_with_retry"])
@@ -208,6 +220,8 @@ flowchart LR
   D3 -->|"Err(e)"| E4
   D3 -->|"Err(e) if attempts < 3"| H2
 ```
+
+</details>
 
 ### A `match` on a request
 
@@ -226,6 +240,11 @@ fn handle(req: Request) -> Result<Response, ApiError> {
     }
 }
 ```
+
+![errpath diagram of a match on a request](docs/diagrams/match-request.png)
+
+<details>
+<summary>Mermaid source</summary>
 
 ```mermaid
 flowchart LR
@@ -254,6 +273,8 @@ flowchart LR
   D3 -->|"Route::Health"| Done
 ```
 
+</details>
+
 ### Early returns
 
 `return Ok` skips the rest. `return Err` is an exit of its own.
@@ -272,6 +293,11 @@ fn import(file: &Path) -> Result<Summary, ImportError> {
     Ok(Summary::new(valid.len()))
 }
 ```
+
+![errpath diagram of a function with early returns](docs/diagrams/early-returns.png)
+
+<details>
+<summary>Mermaid source</summary>
 
 ```mermaid
 flowchart LR
@@ -299,6 +325,8 @@ flowchart LR
   S8 -->|ok| Done
 ```
 
+</details>
+
 ### Closures and async blocks
 
 The closure passed to `traced` is drawn as its own box, inside the function that calls it.
@@ -316,6 +344,11 @@ async fn sync_account(id: AccountId) -> Result<(), SyncError> {
     Ok(())
 }
 ```
+
+![errpath diagram of closures and async blocks](docs/diagrams/closures.png)
+
+<details>
+<summary>Mermaid source</summary>
 
 ```mermaid
 flowchart LR
@@ -345,6 +378,8 @@ flowchart LR
   S10 -->|err| E11
   S10 -->|ok| Done
 ```
+
+</details>
 
 ## What it flags
 
