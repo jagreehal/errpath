@@ -72,7 +72,7 @@ steps:
   - uses: actions/checkout@v7
     with:
       fetch-depth: 0
-  - uses: jagreehal/errpath@v0.1.0
+  - uses: jagreehal/errpath@v0.2.0
 ```
 
 Keep `fail-on` at `never` until the team has read a few weeks of output. `comment-on` sets the lowest risk that gets a PR comment, and defaults to `moderate`.

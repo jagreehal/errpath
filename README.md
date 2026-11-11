@@ -176,7 +176,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: jagreehal/errpath@v0.1.0
+      - uses: jagreehal/errpath@v0.2.0
 ```
 
 You get one PR comment that updates as the branch changes, inline annotations on new findings, and a job summary. Low-risk changes skip the comment and appear only in the summary.
