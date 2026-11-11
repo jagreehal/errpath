@@ -110,6 +110,15 @@ pub enum Node {
         line: usize,
         allowed: Option<String>,
     },
+    /// An error handled where it happens, with nothing fallible in the handler:
+    /// `if let Err(e) = a() { log(e) }`. The path carries on either way.
+    Recover {
+        name: String,
+        how: String,
+        /// The patterns and guards, which decide what gets handled.
+        arms: Vec<String>,
+        line: usize,
+    },
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -738,6 +747,176 @@ fn ok_receiver(e: &Expr) -> Option<&Expr> {
     }
 }
 
+/// `Ok(..)` or `Err(..)`: a pattern that only a `Result` matches. Sees
+/// through a binding, as in `e @ Err(_)`.
+fn result_pat(p: &syn::Pat) -> Option<String> {
+    let t = match unguarded(p) {
+        syn::Pat::TupleStruct(t) => t,
+        syn::Pat::Ident(syn::PatIdent {
+            subpat: Some((_, sub)),
+            ..
+        }) => return result_pat(sub),
+        _ => return None,
+    };
+    let tag = t.path.segments.last()?.ident.to_string();
+    ["Ok", "Err"].contains(&tag.as_str()).then_some(tag)
+}
+
+/// What a returned match arm gives back.
+#[derive(PartialEq)]
+enum Handed {
+    /// `e => e`: the value it matched, error included.
+    Binding,
+    /// A local that may hold anything by the time it's returned:
+    /// `e => { let e = ..; e }`, `mut e => { e = ..; e }`.
+    Local,
+    Other,
+}
+
+fn handed(a: &syn::Arm) -> Handed {
+    let bound = match unguarded(&a.pat) {
+        syn::Pat::Ident(b) => Some(&b.ident),
+        _ => None,
+    };
+    let mut changed = false;
+    let mut e = &*a.body;
+    loop {
+        e = match e {
+            Expr::Block(b) => {
+                if let Some(name) = bound {
+                    let mut r = Rebinds { name, found: false };
+                    changed |= r.stmts(&b.block.stmts) || r.found;
+                }
+                match b.block.stmts.last() {
+                    Some(Stmt::Expr(last, None)) => last,
+                    _ => return Handed::Other,
+                }
+            }
+            Expr::Paren(p) => &p.expr,
+            Expr::Path(p) => {
+                let Some(id) = p.path.get_ident() else {
+                    return Handed::Other;
+                };
+                return if Some(id) == bound && !changed {
+                    // `ok @ Ok(_) => ok` hands back only a success.
+                    match result_pat(&a.pat).as_deref() {
+                        Some("Ok") => Handed::Other,
+                        _ => Handed::Binding,
+                    }
+                } else if id
+                    .to_string()
+                    .starts_with(|c: char| c.is_lowercase() || c == '_')
+                {
+                    Handed::Local
+                } else {
+                    Handed::Other // a constant or unit variant
+                };
+            }
+            _ => return Handed::Other,
+        };
+    }
+}
+
+/// Does code change what `name` holds, by assigning to it or lending it
+/// mutably? Inner scopes that bind `name` again are left out, since there
+/// the name means something else.
+struct Rebinds<'a> {
+    name: &'a syn::Ident,
+    found: bool,
+}
+
+impl Rebinds<'_> {
+    fn names(&self, e: &Expr) -> bool {
+        matches!(e, Expr::Path(p) if p.path.is_ident(self.name))
+    }
+
+    fn binds(&self, p: &syn::Pat) -> bool {
+        let mut bound = Locals::default();
+        bound.visit_pat(p);
+        bound.0.iter().any(|n| self.name == n)
+    }
+
+    /// Visits statements up to a `let` that binds `name` again, and says
+    /// whether one did.
+    fn stmts(&mut self, stmts: &[Stmt]) -> bool {
+        for s in stmts {
+            self.visit_stmt(s);
+            if matches!(s, Stmt::Local(l) if self.binds(&l.pat)) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl<'ast> Visit<'ast> for Rebinds<'_> {
+    fn visit_item(&mut self, _: &'ast syn::Item) {}
+
+    fn visit_block(&mut self, b: &'ast Block) {
+        self.stmts(&b.stmts);
+    }
+
+    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
+        if !c.inputs.iter().any(|p| self.binds(p)) {
+            self.visit_expr(&c.body);
+        }
+    }
+
+    fn visit_arm(&mut self, a: &'ast syn::Arm) {
+        if !self.binds(&a.pat) {
+            visit::visit_arm(self, a);
+        }
+    }
+
+    fn visit_expr_for_loop(&mut self, f: &'ast syn::ExprForLoop) {
+        self.visit_expr(&f.expr);
+        if !self.binds(&f.pat) {
+            self.visit_block(&f.body);
+        }
+    }
+
+    fn visit_expr_if(&mut self, i: &'ast syn::ExprIf) {
+        match &*i.cond {
+            Expr::Let(l) if self.binds(&l.pat) => self.visit_expr(&l.expr),
+            cond => {
+                self.visit_expr(cond);
+                self.visit_block(&i.then_branch);
+            }
+        }
+        if let Some((_, e)) = &i.else_branch {
+            self.visit_expr(e);
+        }
+    }
+
+    fn visit_expr_while(&mut self, w: &'ast syn::ExprWhile) {
+        match &*w.cond {
+            Expr::Let(l) if self.binds(&l.pat) => self.visit_expr(&l.expr),
+            cond => {
+                self.visit_expr(cond);
+                self.visit_block(&w.body);
+            }
+        }
+    }
+
+    fn visit_expr_assign(&mut self, a: &'ast syn::ExprAssign) {
+        self.found |= self.names(&a.left);
+        visit::visit_expr_assign(self, a);
+    }
+
+    fn visit_expr_reference(&mut self, r: &'ast syn::ExprReference) {
+        self.found |= r.mutability.is_some() && self.names(&r.expr);
+        visit::visit_expr_reference(self, r);
+    }
+}
+
+/// A pattern without its guard.
+fn unguarded(p: &syn::Pat) -> &syn::Pat {
+    match p {
+        syn::Pat::Guard(g) => &g.pat,
+        p => p,
+    }
+}
+
 /// Is this a `loop` that nothing breaks out of? Nothing after it can run.
 pub(crate) fn diverges(can_skip: bool, tag: Option<&str>, body: &[Node]) -> bool {
     !can_skip && !breaks_to(body, tag, true)
@@ -888,6 +1067,28 @@ impl Walker<'_> {
         // A fork with nothing fallible in any arm is noise on a railway.
         if arms.iter().any(|a| !a.body.is_empty()) {
             self.nodes.push(Node::Branch { label, arms });
+        }
+    }
+
+    /// A fork on a `Result` whose arms do nothing fallible handles the error
+    /// in place, so it goes on the railway as a recovery.
+    fn recover_or_branch(
+        &mut self,
+        label: String,
+        arms: Vec<Arm>,
+        scrutinee: &Expr,
+        how: Option<(String, Vec<String>)>,
+    ) {
+        match how {
+            Some((how, patterns)) if arms.iter().all(|a| a.body.is_empty()) => {
+                self.nodes.push(Node::Recover {
+                    name: step_label(strip_await(scrutinee)).1,
+                    how,
+                    arms: patterns,
+                    line: line(scrutinee),
+                })
+            }
+            _ => self.push_branch(label, arms),
         }
     }
 
@@ -1159,7 +1360,14 @@ impl<'ast> Visit<'ast> for Walker<'_> {
                 body: other,
             },
         ];
-        self.push_branch(format!("if {}", canon(&*i.cond)), arms);
+        let label = format!("if {}", canon(&*i.cond));
+        match &*i.cond {
+            Expr::Let(l) => {
+                let how = result_pat(&l.pat).map(|t| (format!("if let {t}"), vec![canon(&*l.pat)]));
+                self.recover_or_branch(label, arms, &l.expr, how);
+            }
+            _ => self.push_branch(label, arms),
+        }
     }
 
     fn visit_expr_match(&mut self, m: &'ast syn::ExprMatch) {
@@ -1170,15 +1378,47 @@ impl<'ast> Visit<'ast> for Walker<'_> {
             w.with_tail(false, |w| w.visit_pat(&a.pat));
             w.tail_expr(&a.body);
         };
-        let arms = m
+        let on_result = m.arms.iter().any(|a| result_pat(&a.pat).is_some());
+        // Returned, an arm that hands back its binding carries the error to
+        // the caller: a step on that arm.
+        let returns = on_result && self.tail;
+        let handed: Vec<Handed> = m.arms.iter().map(handed).collect();
+        let at = line(&*m.expr);
+        let arms: Vec<Arm> = m
             .arms
             .iter()
-            .map(|a| Arm {
-                label: canon(&a.pat),
-                body: self.arm(|w| arm(w, a)),
+            .zip(&handed)
+            .map(|(a, h)| {
+                let mut body = self.arm(|w| arm(w, a));
+                if returns && *h == Handed::Binding {
+                    body.extend(self.arm(|w| w.push_step(&m.expr, at)));
+                }
+                Arm {
+                    label: canon(&a.pat),
+                    body,
+                }
             })
             .collect();
-        self.push_branch(format!("match {}", canon(&*m.expr)), arms);
+        // Every error handed back without a guard: the match is the call itself.
+        let plain = m.arms.iter().zip(&arms).zip(&handed).all(|((a, arm), h)| {
+            if *h == Handed::Binding {
+                !matches!(a.pat, syn::Pat::Guard(_)) && arm.body.len() == 1
+            } else {
+                result_pat(&a.pat).as_deref() == Some("Ok") && arm.body.is_empty()
+            }
+        });
+        if returns && plain {
+            return self.push_step(&m.expr, at);
+        }
+        // A returned local may hold an error, so the match can't claim to handle one.
+        let opaque = returns && self.default_err.is_some() && handed.contains(&Handed::Local);
+        let how = (on_result && !opaque).then(|| {
+            (
+                "match".to_string(),
+                m.arms.iter().map(|a| canon(&a.pat)).collect(),
+            )
+        });
+        self.recover_or_branch(format!("match {}", canon(&*m.expr)), arms, &m.expr, how);
     }
 
     fn visit_expr_binary(&mut self, b: &'ast syn::ExprBinary) {
@@ -1910,6 +2150,13 @@ impl Renderer {
                         "  {id}{{{{{}}}}}\n",
                         q(&cap(&format!("dropped: {name} ({how})")))
                     );
+                    self.connect(&open, &id);
+                    open = vec![(id, None)];
+                }
+                Node::Recover { name, how, .. } => {
+                    let id = self.id("R");
+                    self.out +=
+                        &format!("  {id}[{}]\n", q(&cap(&format!("handled: {name} ({how})"))));
                     self.connect(&open, &id);
                     open = vec![(id, None)];
                 }

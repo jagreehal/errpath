@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Errors handled in place, such as `if let Err(e) = a() { log(e) }`, appear in diagrams as handled steps. Reviews rate one added, removed, or changed to catch a different error as moderate risk.
+- A returned `match` that hands its error back (`err => err`) shows as a step with an error exit. A guard on that arm forks the diagram, so reviews catch a changed guard.
+- PR comment diagrams carry a one-line caption saying they show error paths.
+- The README walks through an agent fixing the two-line PR.
+
 ## 0.2.0
 
 - Each `?` now takes its error name from the called function's signature anywhere in the same crate, so more steps show the callee's own error. A library and its binaries resolve as separate crates.

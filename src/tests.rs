@@ -19,6 +19,7 @@ fn no_lines(nodes: &mut [Node]) {
             Node::Fail { line, .. }
             | Node::Panic { line, .. }
             | Node::Swallow { line, .. }
+            | Node::Recover { line, .. }
             | Node::Jump { line, .. } => *line = 0,
             Node::Convert {
                 line, conversions, ..
@@ -46,6 +47,89 @@ fn nodes(src: &str, id: &str) -> Vec<Node> {
         .nodes;
     no_lines(&mut n);
     n
+}
+
+#[test]
+fn a_result_handled_without_anything_fallible_is_a_recovery() {
+    let src = "fn f() { if let Err(e) = a() { log(e); } if let Ok(v) = b().await { use_it(v); } }
+        fn g() -> Result<(), E> { if let Err(e) = a() { return Err(e); } Ok(()) }
+        fn h() { match x() { Some(v) => v, None => 0 }; }";
+    let recover = |name: &str, how: &str, arm: &str| Node::Recover {
+        name: name.into(),
+        how: how.into(),
+        arms: vec![arm.into()],
+        line: 0,
+    };
+    assert_eq!(
+        nodes(src, "f"),
+        vec![
+            recover("a", "if let Err", "Err(e)"),
+            recover("b", "if let Ok", "Ok(v)")
+        ]
+    );
+    // A handler that fails is drawn as the fork it is.
+    assert!(matches!(nodes(src, "g")[0], Node::Branch { .. }));
+    // `Option` carries no error to handle.
+    assert!(nodes(src, "h").is_empty());
+}
+
+#[test]
+fn a_match_that_hands_the_error_back_is_a_step() {
+    let src = "fn a() -> Result<u32, E> { Ok(1) }
+        fn f() -> Result<u32, E> { match a() { Ok(v) => Ok(v), err => err } }
+        fn g() -> Result<u32, E> { log(); match a() { Ok(v) => Ok(v), err => { log(&err); err } } }
+        fn h() -> Result<u32, E> { let r = match a() { Ok(v) => Ok(v), err if retry() => err, _ => Ok(0) }; Ok(1) }";
+    assert_eq!(nodes(src, "f"), vec![step("a", "E")]);
+    assert_eq!(nodes(src, "g"), vec![step("a", "E")]);
+    // Bindings in inner scopes leave the returned error alone.
+    for arm in [
+        "{ { let err = 0; log(err); } err }",
+        "{ run(|err| log(err)); err }",
+        "{ for err in list() { log(err); } err }",
+        "{ if let Some(err) = other() { log(err); } err }",
+        "{ match other() { err => log(err) } err }",
+    ] {
+        let f = format!(
+            "{src} fn s() -> Result<u32, E> {{ match a() {{ Ok(v) => Ok(v), err => {arm} }} }}"
+        );
+        assert_eq!(nodes(&f, "s"), vec![step("a", "E")], "{arm}");
+    }
+    // An inner scope that assigns the outer binding still changes it.
+    let f = format!(
+        "{src} fn t() -> Result<u32, E> {{ match a() {{ Ok(v) => Ok(v), mut err => {{ {{ err = Ok(0); }} err }} }} }}"
+    );
+    assert!(nodes(&f, "t").is_empty());
+    // A success handed back carries no error: the `Err` arm handles it.
+    let j = nodes(
+        &format!(
+            "{src} fn j() -> Result<u32, E> {{ match a() {{ ok @ Ok(_) => ok, Err(_) => Ok(0) }} }}"
+        ),
+        "j",
+    );
+    assert!(matches!(j[..], [Node::Recover { .. }]), "{j:?}");
+    // Bindings on both sides: the error one goes back.
+    let k = nodes(
+        &format!(
+            "{src} fn k() -> Result<u32, E> {{ match a() {{ ok @ Ok(_) => ok, e @ Err(_) => e }} }}"
+        ),
+        "k",
+    );
+    assert_eq!(k, vec![step("a", "E")]);
+    // A guard decides which errors go back: a fork with the step on that arm.
+    let i = nodes(
+        &format!(
+            "{src} fn i(r: bool) -> Result<u32, E> {{ match a() {{ Ok(v) => Ok(v), err if r => err, _ => Ok(0) }} }}"
+        ),
+        "i",
+    );
+    let Node::Branch { arms, .. } = &i[0] else {
+        panic!("{i:?}")
+    };
+    assert_eq!(arms[1].label, "err if r");
+    assert_eq!(arms[1].body, vec![step("a", "E")]);
+    assert!(arms[2].body.is_empty());
+    // Bound to a local, the error stays here.
+    assert!(matches!(nodes(src, "h")[0], Node::Recover { .. }));
 }
 
 fn step(name: &str, error: &str) -> Node {
@@ -824,6 +908,72 @@ mod review {
         assert_eq!(r.new_findings[0].severity, "error");
         assert_eq!(r.new_findings[0].finding.rule, NO_SWALLOW);
         assert_eq!(r.functions[0].removed[0].kind, ItemKind::Step);
+    }
+
+    #[test]
+    fn handling_an_error_locally_is_a_recovery() {
+        let head = BASE.replace(
+            "let x = a()?;",
+            "let x = match a() { Ok(v) => v, Err(e) => { log(e); 0 } };",
+        );
+        let r = diff(BASE, &head);
+        assert_eq!(r.risk, Risk::Moderate);
+        assert_eq!(r.functions[0].added[0].kind, ItemKind::Recover);
+        assert!(
+            r.markdown.contains("handled error from `a`"),
+            "{}",
+            r.markdown
+        );
+        assert!(r.markdown.contains("handled: a (match)"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn handling_a_different_error_is_a_change() {
+        let src = |pat: &str| {
+            format!(
+                "fn a() -> Result<u32, E> {{ Ok(1) }} fn f() {{ if let Err({pat}) = a() {{ log(); }} }}"
+            )
+        };
+        let r = diff(&src("E::A"), &src("E::B"));
+        assert_eq!(r.risk, Risk::Moderate);
+        assert!(
+            r.markdown.contains("arms `Err(E::A)` → `Err(E::B)`"),
+            "{}",
+            r.markdown
+        );
+    }
+
+    #[test]
+    fn a_guard_on_a_handed_back_error_is_a_change() {
+        let src = |guard: &str| {
+            format!("fn a() -> Result<u32, E> {{ Ok(1) }}
+                fn f(retry: bool) -> Result<u32, E> {{ match a() {{ Ok(v) => Ok(v), err if {guard} => err, _ => Ok(0) }} }}")
+        };
+        let r = diff(&src("retry"), &src("!retry"));
+        assert!(r.changed);
+        assert_eq!(r.risk, Risk::Moderate);
+    }
+
+    #[test]
+    fn a_rebound_error_is_neither_handed_back_nor_handled() {
+        let src = |arm: &str| {
+            format!(
+                "fn a() -> Result<u32, E> {{ Ok(1) }}
+                fn f() -> Result<u32, E> {{ match a() {{ Ok(v) => Ok(v), {arm} }} }}"
+            )
+        };
+        for arm in [
+            "err => { let err = Ok(0); err }",
+            "err => { let err = Err(E::B); err }",
+            "mut err => { err = Ok(0); err }",
+            "mut err => { reset(&mut err); err }",
+        ] {
+            let r = diff(&src("err => err"), &src(arm));
+            assert!(r.changed, "{arm}");
+            let f = &r.functions[0];
+            assert!(f.added.is_empty(), "{arm}: {:?}", f.added);
+            assert_eq!(f.removed[0].kind, ItemKind::Step, "{arm}");
+        }
     }
 
     #[test]

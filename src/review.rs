@@ -45,6 +45,8 @@ pub enum ItemKind {
     Fail,
     Panic,
     Swallow,
+    /// An error handled where it happens, so it no longer reaches the caller.
+    Recover,
     /// An explicit `return` that succeeds, skipping whatever follows.
     Return,
     /// `break` or `continue`, deciding what runs next.
@@ -69,7 +71,8 @@ pub struct State {
     #[serde(skip)]
     conversion_ids: Vec<String>,
     pub allowed: Option<String>,
-    /// For a `match`: its arms in order, which decide what each one catches.
+    /// For a `match` or a recovery: its patterns in order, which decide what
+    /// each one catches.
     pub arms: Vec<String>,
     /// For a jump: how many loops and labelled blocks out it lands, 0 being the
     /// innermost. This, not the label's spelling, is what makes it the same jump.
@@ -282,6 +285,24 @@ fn flatten(nodes: &[Node], f: &Function, context: &str, tags: &[Frame], out: &mu
                     &[],
                     allowed,
                 ));
+            }
+            Node::Recover {
+                name,
+                how,
+                arms,
+                line,
+            } => {
+                let mut recover = item(
+                    ItemKind::Recover,
+                    name,
+                    None,
+                    *line,
+                    format!("recover {how} {name}"),
+                    &[],
+                    &None,
+                );
+                recover.state.arms = arms.clone();
+                out.push(recover);
             }
             Node::Succeed => out.push(item(
                 ItemKind::Return,
@@ -596,8 +617,11 @@ fn alters_behaviour(c: &ItemChange) -> bool {
             .cloned()
             .collect::<Vec<_>>()
     };
+    // A recovery's patterns decide which errors it handles.
+    let handles = c.item.kind == ItemKind::Recover && c.from.arms != c.item.state.arms;
     c.from.context != c.item.state.context
         || c.from.target != c.item.state.target
+        || handles
         || typed(&c.from) != typed(&c.item.state)
 }
 
@@ -833,11 +857,14 @@ pub fn compare(base: &Report, head: &Report, collapse_diagrams: bool) -> Review 
     }
 
     // These coming or going decide what else runs, unlike a step doing so.
+    // A recovery decides whether an error reaches the caller at all.
     let jumps = |f: &FnChange| {
-        f.added
-            .iter()
-            .chain(&f.removed)
-            .any(|i| matches!(i.kind, ItemKind::Jump | ItemKind::Diverge))
+        f.added.iter().chain(&f.removed).any(|i| {
+            matches!(
+                i.kind,
+                ItemKind::Jump | ItemKind::Diverge | ItemKind::Recover
+            )
+        })
     };
     let altered = |f: &FnChange| {
         f.returns.is_some() || f.reordered || jumps(f) || f.changed.iter().any(alters_behaviour)
@@ -938,6 +965,7 @@ fn item_line(i: &Item) -> String {
         ItemKind::Fail => format!("failure exit {}", span(&i.label)),
         ItemKind::Panic => format!("panic path {}", span(&i.label)),
         ItemKind::Swallow => format!("dropped error from {}", span(&i.label)),
+        ItemKind::Recover => format!("handled error from {}", span(&i.label)),
         ItemKind::Return => "early return".to_string(),
         ItemKind::Jump => span(&i.label),
         ItemKind::Fork => span(&i.label),
@@ -1089,7 +1117,9 @@ fn markdown(r: &Review, collapse: bool, diagrams: bool) -> String {
         }
         s += "\n";
         if let Some(d) = f.diagram.as_ref().filter(|_| diagrams && i < MAX_DIAGRAMS) {
-            let body = format!("```mermaid\n{d}```\n");
+            let body = format!(
+                "_Error paths: each step that can fail, and where its error goes._\n\n```mermaid\n{d}```\n"
+            );
             if collapse {
                 let _ = writeln!(
                     s,

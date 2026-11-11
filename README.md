@@ -393,6 +393,7 @@ flowchart LR
 | | A step moved into or out of a branch or loop, or a condition changed |
 | | An error conversion changed: `map_err(Top::A)` to `map_err(Top::B)` |
 | | Exits reordered, a return type changed, or `break`/`continue` added or retargeted |
+| | An error handled where it happens added, removed, or changed to catch a different error: `if let Err(e) = send() { log(e) }` |
 | **Low** | A step, failure exit or early return added or removed |
 | | `.context("...")` text or `match` arms changed |
 
@@ -422,7 +423,7 @@ The reason is required, and every new allow still appears in the review, so noth
 - **Data flow.** A loop with nothing fallible can set a variable that a later `if` fails on. The two aren't connected.
 - **Identical calls.** Steps are identified by callee, not arguments, so swapping two `read(r)?` calls that differ only in their arguments looks the same.
 - **Diverging calls.** A call to a `fn() -> !` isn't known to stop the path, and `while true {}` isn't treated as endless.
-- **Recovery.** `if let Err(e) = a() { .. }` handles an error without a step, so it isn't tracked as an exit.
+- **Recovery.** `if let Err(e) = a() { log(e) }`, and a `match` on `Ok`/`Err` with nothing fallible in its arms, show as a handled step. The diagram shows that the error stops there, and leaves out what the handler does with it. A returned arm that rebinds or assigns its error before returning it shows neither a handled step nor an exit. `unwrap_or_else` and `or_else` count as plain calls.
 - **Test code.** `#[test]`, `#[cfg(test)]` and a package's `tests/`, `benches/` and `examples/` are skipped. Code behind `cfg(any(test, feature = "..."))` is analysed, because a feature can be on in production.
 
 These edits produce a report even though behaviour stays the same:
@@ -501,6 +502,35 @@ npx skills add jagreehal/errpath --skill errpath
 ```
 
 The [skill](skills/errpath/SKILL.md) teaches a coding agent to run a review and act on its findings.
+
+Give an agent the [two-line PR above](#a-two-line-pr-that-hides-two-problems). It runs `cargo errpath review --base main --format json` and reads:
+
+```json
+{
+  "risk": "high",
+  "newFindings": [
+    { "severity": "warning", "rule": "no-panic", "line": 2,
+      "message": "`price.expect` can panic", "confidence": "certain" },
+    { "severity": "error", "rule": "no-swallow", "line": 8,
+      "message": "`let _ =` drops the error from `send_confirmation`", "confidence": "certain" }
+  ]
+}
+```
+
+A pricing failure should reach the caller, so the agent restores the `?`. A failed email shouldn't cancel a paid order, so the agent logs that error:
+
+```rust
+let total = price(cart)?;
+// ...
+if let Err(e) = send_confirmation(&receipt) {
+    log::warn!("confirmation email failed: {e}");
+}
+```
+
+The agent reviews again and gets no findings. Reviewers still see the email decision:
+
+> - added handled error from `send_confirmation`
+> - removed step `send_confirmation` → `EmailError`
 
 ## License
 
