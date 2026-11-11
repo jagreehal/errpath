@@ -1,8 +1,11 @@
 name: render-md-mermaid
 
-# Renders each README diagram to a PNG, so GitHub Mobile shows it too.
+# Renders each README diagram to a PNG, so GitHub Mobile shows it too. It runs
+# on branches, so the images reach main with the pull request.
 on:
   push:
+    branches-ignore:
+      - main
     paths:
       - "README.md"
 
