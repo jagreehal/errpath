@@ -1,6 +1,6 @@
 [package]
 name = "cargo-errpath"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "See how a Rust PR changes error propagation, recovery and panic paths"
 license = "Apache-2.0"
