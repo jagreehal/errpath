@@ -3,11 +3,17 @@ use cargo_errpath::{analyse_path, render};
 use std::path::Path;
 use std::process::exit;
 
+mod gate;
+
 const USAGE: &str = "usage:
+  cargo errpath check [--base <ref>] rustfmt, Clippy, errpath, cargo-deny and cargo-shear
+  cargo errpath init                 write the CI workflow and Claude Code hooks
+  cargo errpath hook <kind>          a Claude Code hook (start, edit, stop), JSON on stdin
   cargo errpath ir [path]            JSON IR for a file or directory (default: src)
   cargo errpath diagram <path> <fn>  Mermaid diagram for one function (id or name)
   cargo errpath review --base <ref> [--head <ref>] [paths...]
-      [--format markdown|json] [--diagrams open|collapsed] [-o <file>]";
+      [--format markdown|json] [--diagrams open|collapsed] [-o <file>]
+      without --head, reviews the work tree, uncommitted edits included";
 
 fn fail(code: i32, msg: impl std::fmt::Display) -> ! {
     eprintln!("{msg}");
@@ -49,20 +55,33 @@ fn main() {
             }
         }
         ["review", ref rest @ ..] => review(rest),
+        ["check"] => check(gate::default_base()),
+        ["check", "--base", base] => check(base),
+        ["init"] => exit(gate::init()),
+        ["hook", kind @ ("start" | "edit" | "stop")] => exit(gate::hook(kind)),
         _ => fail(2, USAGE),
+    }
+}
+
+fn check(base: &str) {
+    eprintln!("errpath check: comparing with {base}\n");
+    // Like cargo itself: the workspace of the current directory.
+    let here = std::env::current_dir().unwrap_or_else(|e| fail(1, e));
+    if !gate::print(&gate::check(base, &[here])) {
+        exit(1);
     }
 }
 
 fn review(args: &[&str]) {
     let (mut base, mut head, mut format, mut diagrams, mut out) =
-        (None, "HEAD", "markdown", "open", None);
+        (None, None, "markdown", "open", None);
     let mut paths = vec![];
     let mut args = args.iter().copied();
     while let Some(a) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| fail(2, USAGE));
         match a {
             "--base" => base = Some(value()),
-            "--head" => head = value(),
+            "--head" => head = Some(value()),
             "--format" => format = value(),
             "--diagrams" => diagrams = value(),
             "-o" => out = Some(value()),

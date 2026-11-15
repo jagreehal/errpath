@@ -5,8 +5,8 @@
 //! error is converted, whether it's allowed). Comparing them separately keeps
 //! "same call, now inside an `if`" from cancelling out as no change.
 use crate::{
-    Confidence, Coverage, ErrorSource, Finding, Function, Locals, NO_PANIC, Node, Report, Returns,
-    add_findings, module_of, render,
+    Confidence, Coverage, ErrorSource, Finding, Function, Locals, NO_SWALLOW, Node, Report,
+    Returns, add_findings, module_of, render,
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -47,6 +47,8 @@ pub enum ItemKind {
     Swallow,
     /// An error handled where it happens, so it no longer reaches the caller.
     Recover,
+    /// An error handler that records nothing OpenTelemetry can see.
+    Unrecorded,
     /// An explicit `return` that succeeds, skipping whatever follows.
     Return,
     /// `break` or `continue`, deciding what runs next.
@@ -197,7 +199,10 @@ fn flatten(nodes: &[Node], f: &Function, context: &str, tags: &[Frame], out: &mu
     for n in nodes {
         let mut found = vec![];
         add_findings(std::slice::from_ref(n), f, &mut found);
-        let finding = if matches!(n, Node::Panic { .. } | Node::Swallow { .. }) {
+        let finding = if matches!(
+            n,
+            Node::Panic { .. } | Node::Swallow { .. } | Node::Unrecorded { .. }
+        ) {
             found.pop()
         } else {
             None
@@ -286,6 +291,21 @@ fn flatten(nodes: &[Node], f: &Function, context: &str, tags: &[Frame], out: &mu
                     allowed,
                 ));
             }
+            Node::Unrecorded {
+                name,
+                how,
+                line,
+                confidence,
+                allowed,
+            } => out.push(item(
+                ItemKind::Unrecorded,
+                name,
+                None,
+                *line,
+                format!("unrecorded {how} {name} {confidence:?}"),
+                &[],
+                allowed,
+            )),
             Node::Recover {
                 name,
                 how,
@@ -712,8 +732,10 @@ fn pair<'a>(base: &'a [Function], head: &'a [Function]) -> Paired<'a> {
     (pairs, added, removed)
 }
 
+/// Only a certainly dropped error is high risk. A panic, or an error handled
+/// without a trace, is moderate.
 fn severity(f: &Finding) -> &'static str {
-    if f.rule != NO_PANIC && f.confidence == Confidence::Certain {
+    if f.rule == NO_SWALLOW && f.confidence == Confidence::Certain {
         "error"
     } else {
         "warning"
@@ -966,6 +988,7 @@ fn item_line(i: &Item) -> String {
         ItemKind::Panic => format!("panic path {}", span(&i.label)),
         ItemKind::Swallow => format!("dropped error from {}", span(&i.label)),
         ItemKind::Recover => format!("handled error from {}", span(&i.label)),
+        ItemKind::Unrecorded => format!("unrecorded error from {}", span(&i.label)),
         ItemKind::Return => "early return".to_string(),
         ItemKind::Jump => span(&i.label),
         ItemKind::Fork => span(&i.label),
@@ -1149,6 +1172,21 @@ fn markdown(r: &Review, collapse: bool, diagrams: bool) -> String {
     s
 }
 
+/// A path from a command's output, kept as the filesystem's bytes: on Unix a
+/// path needn't be UTF-8, and a lossy copy names nothing. Windows paths from
+/// git and cargo are UTF-8 already.
+pub fn path_from_bytes(bytes: &[u8]) -> std::path::PathBuf {
+    #[cfg(unix)]
+    return <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(bytes).into();
+    #[cfg(not(unix))]
+    return String::from_utf8_lossy(bytes).into_owned().into();
+}
+
+/// One path printed on a line, as `git rev-parse` and `cargo locate-project` do.
+pub fn path_line(out: &[u8]) -> std::path::PathBuf {
+    path_from_bytes(out.strip_suffix(b"\n").unwrap_or(out))
+}
+
 fn git(top: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let out = Command::new("git")
         .arg("-C")
@@ -1178,13 +1216,12 @@ pub(crate) fn is_support_code(path: &str) -> bool {
 
 /// Analyses every Rust file at a commit, reading from git, not the work tree.
 // Unchanged files are analysed too, since a `mod tests;` in an unchanged parent
-// decides what counts as test code. `git cat-file --batch` would cut the process
-// count on big repos.
+// decides what counts as test code.
 fn report_at(top: &Path, commit: &str, paths: &[&str]) -> Result<Report, String> {
     let mut args = vec!["ls-tree", "-r", "-z", commit, "--"];
     args.extend(paths);
     let listing = git(top, &args)?;
-    let mut report = Report::new();
+    let mut files = vec![];
     for entry in listing.split(|b| *b == 0) {
         // `<mode> <type> <oid>\t<path>`. Paths needn't be UTF-8 and git output
         // reaches us lossily, so blobs are read by oid, never by name.
@@ -1198,21 +1235,115 @@ fn report_at(top: &Path, commit: &str, paths: &[&str]) -> Result<Report, String>
         if kind != "blob" || mode == "120000" || !path.ends_with(".rs") {
             continue; // submodules and symlinks hold no source here
         }
-        if is_support_code(path) {
-            report.support_files_skipped += 1;
-            continue;
-        }
-        let src = git(top, &["cat-file", "blob", oid])
-            .and_then(|b| String::from_utf8(b).map_err(|e| e.to_string()));
-        match src {
-            Ok(src) => report.add_source(path, &module_of(Path::new(path)), &src),
-            Err(message) => report.parse_failures.push(crate::ParseFailure {
-                file: path.into(),
-                message,
-            }),
-        }
+        files.push((path.to_string(), oid.to_string()));
+    }
+    let mut blobs = read_blobs(top, files.iter().map(|(_, oid)| oid.as_str()))?.into_iter();
+    let mut report = Report::new();
+    for (path, _) in &files {
+        let blob = blobs.next().ok_or("git cat-file returned too few blobs")?;
+        add(&mut report, path, || blob);
     }
     Ok(report.finish())
+}
+
+/// Reads blobs in one `git cat-file --batch`, in the order asked: one process
+/// per file took seconds on a crate the size of tokio.
+fn read_blobs<'a>(
+    top: &Path,
+    oids: impl Iterator<Item = &'a str>,
+) -> Result<Vec<Result<Vec<u8>, String>>, String> {
+    use std::io::Write as _;
+    let input: String = oids.map(|o| format!("{o}\n")).collect();
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(top)
+        .args(["cat-file", "--batch"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("git cat-file: no stdin")?;
+    // Written from a thread: git stops reading once its output pipe is full.
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let out = child.wait_with_output().map_err(|e| format!("git: {e}"))?;
+    match writer.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(format!("git cat-file --batch: {e}")),
+        Err(_) => return Err("git cat-file --batch: writer panicked".into()),
+    }
+    if !out.status.success() {
+        return Err(format!(
+            "git cat-file --batch: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // Each answer is `<oid> blob <size>\n<bytes>\n`, or `<oid> missing\n`.
+    let (mut blobs, mut rest) = (vec![], &out.stdout[..]);
+    while let Some(nl) = rest.iter().position(|b| *b == b'\n') {
+        let header = String::from_utf8_lossy(&rest[..nl]).into_owned();
+        rest = &rest[nl + 1..];
+        let size = match header.split(' ').collect::<Vec<_>>()[..] {
+            [_, "blob", size] => size.parse::<usize>().ok(),
+            _ => None,
+        };
+        match size {
+            Some(n) if rest.len() > n => {
+                blobs.push(Ok(rest[..n].to_vec()));
+                rest = &rest[n + 1..];
+            }
+            _ => blobs.push(Err(format!("git cat-file: {header}"))),
+        }
+    }
+    Ok(blobs)
+}
+
+/// Analyses the work tree: tracked files as they are on disk, plus untracked
+/// ones git doesn't ignore, so an edit counts before it's committed.
+fn report_worktree(top: &Path, paths: &[&str]) -> Result<Report, String> {
+    let mut args = vec![
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "--",
+    ];
+    args.extend(paths);
+    let listing = git(top, &args)?;
+    let mut report = Report::new();
+    let mut seen = HashSet::new();
+    for raw in listing.split(|b| *b == 0) {
+        let path = String::from_utf8_lossy(raw);
+        let file = top.join(path_from_bytes(raw));
+        // A file deleted but not yet staged is still listed; so is a conflict, thrice.
+        if !path.ends_with(".rs")
+            || !file.is_file()
+            || file.is_symlink()
+            || !seen.insert(path.clone())
+        {
+            continue;
+        }
+        add(&mut report, &path, || {
+            std::fs::read(&file).map_err(|e| e.to_string())
+        });
+    }
+    Ok(report.finish())
+}
+
+fn add(report: &mut Report, path: &str, read: impl FnOnce() -> Result<Vec<u8>, String>) {
+    if is_support_code(path) {
+        report.support_files_skipped += 1;
+        return;
+    }
+    // errpath: allow(no-trace) a file that can't be read is a parse failure, which every review prints
+    match read().and_then(|b| String::from_utf8(b).map_err(|e| e.to_string())) {
+        Ok(src) => report.add_source(path, &module_of(Path::new(path)), &src),
+        Err(message) => report.parse_failures.push(crate::ParseFailure {
+            file: path.into(),
+            message,
+        }),
+    }
 }
 
 fn resolve(top: &Path, rev: &str) -> Result<String, String> {
@@ -1221,34 +1352,52 @@ fn resolve(top: &Path, rev: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out).trim().to_string())
 }
 
+/// A tree as the base, like the empty tree a repo starts from: no merge base.
+fn resolve_tree(top: &Path, rev: &str) -> Option<String> {
+    let spec = format!("{rev}^{{tree}}");
+    let out = git(top, &["rev-parse", "--verify", "--end-of-options", &spec]).ok()?;
+    Some(String::from_utf8_lossy(&out).trim().to_string())
+}
+
 pub struct Options<'a> {
     pub base: &'a str,
-    pub head: &'a str,
+    /// A ref, or `None` for the work tree, uncommitted edits included.
+    pub head: Option<&'a str>,
     /// Repo-relative paths to limit the review to; empty means everything.
     pub paths: &'a [&'a str],
     pub collapse_diagrams: bool,
 }
 
 pub fn run(o: &Options) -> Result<Review, String> {
-    let top = git(Path::new("."), &["rev-parse", "--show-toplevel"])?;
-    let top = String::from_utf8_lossy(&top).trim().to_string();
-    let top = Path::new(&top);
-    let (base, head) = (resolve(top, o.base)?, resolve(top, o.head)?);
-    // From where the branch left, or a base that moved on would be read as the
-    // branch undoing everything merged since.
-    let start = match git(top, &["merge-base", &base, &head]) {
-        Ok(out) => String::from_utf8_lossy(&out).trim().to_string(),
-        Err(_) => {
-            eprintln!(
-                "no merge base with {}, so comparing against it directly (a shallow clone?)",
-                o.base
-            );
-            base
-        }
+    let top = path_line(&git(Path::new("."), &["rev-parse", "--show-toplevel"])?);
+    let top = top.as_path();
+    let head = match o.head {
+        Some(h) => Some(resolve(top, h)?),
+        // A branch with no commits yet has only its work tree.
+        None => resolve(top, "HEAD").ok(),
+    };
+    let start = match (resolve(top, o.base), head.as_deref()) {
+        // From where the branch left, or a base that moved on would be read as
+        // the branch undoing everything merged since.
+        (Ok(base), Some(head)) => match git(top, &["merge-base", &base, head]) {
+            Ok(out) => String::from_utf8_lossy(&out).trim().to_string(),
+            Err(_) => {
+                eprintln!(
+                    "no merge base with {}, so comparing against it directly (a shallow clone?)",
+                    o.base
+                );
+                base
+            }
+        },
+        (Ok(base), None) => base,
+        (Err(e), _) => resolve_tree(top, o.base).ok_or(e)?,
     };
     Ok(compare(
         &report_at(top, &start, o.paths)?,
-        &report_at(top, &head, o.paths)?,
+        &match &head {
+            Some(head) if o.head.is_some() => report_at(top, head, o.paths)?,
+            _ => report_worktree(top, o.paths)?,
+        },
         o.collapse_diagrams,
     ))
 }

@@ -1,5 +1,5 @@
 // Failures that leave the railway without a `?`: all of these pass default Clippy.
-#![allow(dead_code)]
+#![allow(dead_code)] #![cfg_attr(rustfmt, rustfmt::skip)] // line numbers are asserted in tests
 use std::io;
 
 fn commit() -> Result<u32, io::Error> { Ok(1) }

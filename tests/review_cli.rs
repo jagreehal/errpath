@@ -129,7 +129,10 @@ fn hostile_tree_entries_do_not_abort_the_review() {
     assert!(child.wait().unwrap().success());
     git(&dir, &["commit", "-qm", "c"]);
 
-    let out = review(&dir, &["--base", "base", "--format", "json"]);
+    let out = review(
+        &dir,
+        &["--base", "base", "--head", "HEAD", "--format", "json"],
+    );
     assert!(
         out.status.success(),
         "{}",
@@ -139,6 +142,16 @@ fn hostile_tree_entries_do_not_abort_the_review() {
     assert_eq!(v["newFindings"].as_array().unwrap().len(), 1, "{v}"); // bad\xff.rs was read
     assert_eq!(v["unparsed_files"], 1, "{v}"); // binary.rs, and it's said out loud
     assert_eq!(v["risk"], "moderate");
+
+    // The work tree: bad\xff.rs only ever lived in the index, so it's gone from disk.
+    let out = review(&dir, &["--base", "base", "--format", "json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["unparsed_files"], 1, "{v}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -180,7 +193,7 @@ fn reviews_two_refs_from_a_subdirectory() {
         "src/lib.rs",
         "#[cfg(test)] mod tests;\nfn a() -> Result<u32, E> { Ok(1) }\nfn f() -> Result<u32, E> {\n    let _ = a();\n    a()\n}\n",
     );
-    // The work tree is ignored: only the refs count.
+    // With --head, the work tree is ignored: only the refs count.
     std::fs::write(dir.join("src/lib.rs"), "not rust (").unwrap();
 
     let report = dir.join("r.json");
@@ -189,6 +202,8 @@ fn reviews_two_refs_from_a_subdirectory() {
         &[
             "--base",
             "base",
+            "--head",
+            "HEAD",
             "--format",
             "json",
             "-o",
@@ -210,5 +225,468 @@ fn reviews_two_refs_from_a_subdirectory() {
     assert_eq!(out.status.code(), Some(1));
     let out = review(&dir, &[]);
     assert_eq!(out.status.code(), Some(2));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn errpath(dir: &Path, args: &[&str], stdin: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cargo-errpath"))
+        .arg("errpath")
+        .args(args)
+        .current_dir(dir)
+        .env("CARGO_TARGET_DIR", dir.join("target"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn repo(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("errpath-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    dir
+}
+
+#[test]
+fn reviews_uncommitted_and_untracked_edits_without_head() {
+    let dir = repo("worktree");
+    commit(&dir, "src/lib.rs", "mod gone;\nfn f() {}\n");
+    commit(&dir, "src/gone.rs", "fn g() {}\n");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "mod new;\nfn f() { x().unwrap(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/new.rs"),
+        "fn n() { let _ = std::fs::remove_file(\"a\"); }\n",
+    )
+    .unwrap();
+    std::fs::remove_file(dir.join("src/gone.rs")).unwrap();
+
+    let out = review(&dir, &["--base", "HEAD", "--format", "json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut files: Vec<_> = v["newFindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["file"].as_str().unwrap())
+        .collect();
+    files.sort_unstable();
+    assert_eq!(files, ["src/lib.rs", "src/new.rs"], "{v}");
+
+    // A ref as head still reads only git.
+    let out = review(&dir, &["--base", "HEAD", "--head", "HEAD"]);
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn edit_hook_blocks_only_on_the_edited_files_new_findings() {
+    let dir = repo("hook-edit");
+    commit(&dir, "src/lib.rs", "#[cfg(test)] mod tests;\nfn f() {}\n");
+    commit(&dir, "src/tests.rs", "fn t() {}\n");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "#[cfg(test)] mod tests;\nfn f() { x().unwrap(); }\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/tests.rs"), "fn t() { x().unwrap(); }\n").unwrap();
+    let hook = |file: &Path| {
+        let input = serde_json::json!({ "tool_input": { "file_path": file } }).to_string();
+        errpath(&dir, &["hook", "edit"], &input)
+    };
+
+    let out = hook(&dir.join("src/lib.rs"));
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("src/lib.rs:2 no-panic"), "{err}");
+
+    // Test code, a file without findings, and a non-Rust file pass.
+    assert_eq!(hook(&dir.join("src/tests.rs")).status.code(), Some(0));
+    std::fs::write(dir.join("README.md"), "x").unwrap();
+    assert_eq!(hook(&dir.join("README.md")).status.code(), Some(0));
+
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "#[cfg(test)] mod tests;\n// errpath: allow(no-panic) x is checked at startup\nfn f() { x().unwrap(); }\n",
+    )
+    .unwrap();
+    assert_eq!(hook(&dir.join("src/lib.rs")).status.code(), Some(0));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn crate_repo(name: &str) -> std::path::PathBuf {
+    let dir = repo(name);
+    commit(&dir, ".gitignore", "target\n");
+    commit(
+        &dir,
+        "Cargo.toml",
+        "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    commit(&dir, "src/lib.rs", "pub fn f() {}\n");
+    dir
+}
+
+fn stop_json(out: &Output) -> serde_json::Value {
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stdout)))
+}
+
+fn blocked(out: &Output) -> String {
+    let v = stop_json(out);
+    assert_eq!(v["decision"], "block", "{v}");
+    v["reason"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn stop_hook_blocks_once_then_tells_the_person() {
+    let dir = crate_repo("hook-stop");
+
+    // Clean tree: nothing to check.
+    let out = errpath(&dir, &["hook", "stop"], "{}");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+
+    // One panic allowed, one not, and a file errpath can't read.
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn f() -> u8 {\n    // errpath: allow(no-panic) a literal always parses\n    \"1\".parse().unwrap()\n}\n\npub fn g() -> u8 {\n    \"2\".parse().unwrap()\n}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/orphan.rs"), [0xff, 0xfe]).unwrap();
+    // Run from a subdirectory: the change is still found at the root.
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    let out = errpath(
+        &dir.join("nested"),
+        &["hook", "stop"],
+        r#"{"stop_hook_active": false}"#,
+    );
+    let reason = blocked(&out);
+    assert!(reason.contains("src/lib.rs:7 no-panic"), "{reason}");
+    assert!(
+        !reason.contains("fmt:") && !reason.contains("clippy:"),
+        "{reason}"
+    );
+    // The first block tells the person too.
+    let msg = stop_json(&out)["systemMessage"].to_string();
+    assert!(msg.contains("a literal always parses"), "{msg}");
+    assert!(
+        msg.contains("not analysed") && msg.contains("src/orphan.rs"),
+        "{msg}"
+    );
+
+    // Already retrying: no second block. The person hears about the failure,
+    // and still sees the allow reason.
+    let v = stop_json(&errpath(
+        &dir,
+        &["hook", "stop"],
+        r#"{"stop_hook_active": true}"#,
+    ));
+    assert!(v.get("decision").is_none(), "{v}");
+    let msg = v["systemMessage"].as_str().unwrap();
+    assert!(msg.contains("Still failing"), "{msg}");
+    assert!(msg.contains("a literal always parses"), "{msg}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn stop_hook_checks_a_manifest_only_change() {
+    let dir = crate_repo("hook-manifest");
+    std::fs::write(dir.join("Cargo.toml"), "[package\n").unwrap();
+    let reason = blocked(&errpath(&dir, &["hook", "stop"], "{}"));
+    assert!(
+        reason.contains("fmt:") || reason.contains("clippy:"),
+        "{reason}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn work_the_session_commits_still_counts_after_a_resume() {
+    let dir = crate_repo("hook-session");
+    let session = r#"{"session_id": "abc-1"}"#;
+    assert_eq!(
+        errpath(&dir, &["hook", "start"], session).status.code(),
+        Some(0)
+    );
+    commit(
+        &dir,
+        "src/lib.rs",
+        "pub fn f() -> u8 {\n    \"1\".parse().unwrap()\n}\n",
+    );
+    let reason = blocked(&errpath(&dir, &["hook", "stop"], session));
+    assert!(reason.contains("src/lib.rs:2 no-panic"), "{reason}");
+
+    // Exit and resume: the base stays where the session began.
+    errpath(&dir, &["hook", "start"], session);
+    let reason = blocked(&errpath(&dir, &["hook", "stop"], session));
+    assert!(reason.contains("src/lib.rs:2 no-panic"), "{reason}");
+
+    // Without the session, only uncommitted work counts.
+    let out = errpath(&dir, &["hook", "stop"], "{}");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_session_started_before_the_first_commit_owns_everything() {
+    let dir = repo("hook-unborn");
+    let session = r#"{"session_id": "abc-2"}"#;
+    assert_eq!(
+        errpath(&dir, &["hook", "start"], session).status.code(),
+        Some(0)
+    );
+    commit(&dir, ".gitignore", "target\n");
+    commit(
+        &dir,
+        "Cargo.toml",
+        "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    commit(
+        &dir,
+        "src/lib.rs",
+        "pub fn f() -> u8 {\n    \"1\".parse().unwrap()\n}\n",
+    );
+    let reason = blocked(&errpath(&dir, &["hook", "stop"], session));
+    assert!(reason.contains("src/lib.rs:2 no-panic"), "{reason}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn edit_hook_works_before_the_first_commit() {
+    let dir = repo("edit-unborn");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "fn f() { x().unwrap(); }\n").unwrap();
+    let input = serde_json::json!({ "tool_input": { "file_path": dir.join("src/lib.rs") } });
+    let out = errpath(&dir, &["hook", "edit"], &input.to_string());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("src/lib.rs:1 no-panic"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn init_names_the_hooks_an_existing_config_lacks() {
+    let dir = repo("init-partial");
+    std::fs::create_dir_all(dir.join(".claude")).unwrap();
+    let partial = r#"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "cargo errpath hook stop"}]}]}}"#;
+    std::fs::write(dir.join(".claude/settings.json"), partial).unwrap();
+    let out = errpath(&dir, &["init"], "");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(
+        err.contains("lacks `cargo errpath hook start`, `cargo errpath hook edit`"),
+        "{err}"
+    );
+    assert!(
+        err.contains(".github/workflows/errpath.yml: written"),
+        "{err}"
+    );
+    assert!(err.contains("cargo add autotel"), "{err}");
+    // Never overwritten.
+    assert_eq!(
+        std::fs::read_to_string(dir.join(".claude/settings.json")).unwrap(),
+        partial
+    );
+    let out = errpath(&dir, &["init"], "");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(".github/workflows/errpath.yml: already set up"),
+        "{err}"
+    );
+    // Once a manifest brings in autotel, init stops suggesting it.
+    commit(
+        &dir,
+        "Cargo.toml",
+        &format!("{PACKAGE}\n[dependencies]\nautotel = \"0.2\"\n"),
+    );
+    let out = errpath(&dir, &["init"], "");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("cargo add autotel"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn stop_hook_checks_every_workspace_the_change_touched() {
+    let dir = crate_repo("hook-workspaces");
+    // An independent crate inside the repository, with its own workspace.
+    commit(
+        &dir,
+        "nested/Cargo.toml",
+        "[package]\nname = \"n\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    commit(&dir, "nested/src/lib.rs", "pub fn n() {}\n");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn f() -> u8 {\n    \"not a number\"\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("nested/src/lib.rs"),
+        "pub fn n() -> u8 {\n    1\n}\n",
+    )
+    .unwrap();
+
+    // From the nested crate, the root crate's type error still blocks.
+    let reason = blocked(&errpath(&dir.join("nested"), &["hook", "stop"], "{}"));
+    assert!(reason.contains("E0308"), "{reason}");
+    assert!(reason.contains("clippy:"), "{reason}");
+    assert!(!reason.contains("clippy (nested)"), "{reason}");
+
+    // And from the root, a broken nested crate blocks, named by its directory.
+    std::fs::write(dir.join("src/lib.rs"), "pub fn f() -> u8 {\n    1\n}\n").unwrap();
+    std::fs::write(
+        dir.join("nested/src/lib.rs"),
+        "pub fn n() -> u8 {\n    \"not a number\"\n}\n",
+    )
+    .unwrap();
+    let reason = blocked(&errpath(&dir, &["hook", "stop"], "{}"));
+    assert!(reason.contains("clippy (nested):"), "{reason}");
+    assert!(reason.contains("E0308"), "{reason}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+const PACKAGE: &str = "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+const TYPE_ERROR: &str = "pub fn f() -> u8 {\n    \"not a number\"\n}\n";
+
+#[test]
+fn stop_hook_finds_a_crate_with_a_non_ascii_path() {
+    let dir = repo("hook-unicode");
+    commit(&dir, ".gitignore", "target\n");
+    commit(&dir, "é/Cargo.toml", PACKAGE);
+    commit(&dir, "é/src/lib.rs", "pub fn f() {}\n");
+    // Git's line output would quote this as "\303\251/src/lib.rs".
+    std::fs::write(dir.join("é/src/lib.rs"), TYPE_ERROR).unwrap();
+    let reason = blocked(&errpath(&dir, &["hook", "stop"], "{}"));
+    assert!(reason.contains("clippy (é):"), "{reason}");
+    assert!(reason.contains("E0308"), "{reason}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn stop_hook_checks_workspaces_below_a_changed_shared_config() {
+    let dir = repo("hook-config");
+    commit(&dir, ".gitignore", "target\n");
+    commit(&dir, "app/Cargo.toml", PACKAGE);
+    commit(&dir, "app/src/lib.rs", "pub fn f() {}\n");
+    // No manifest above it: only the crate below can be affected.
+    std::fs::create_dir_all(dir.join(".cargo")).unwrap();
+    std::fs::write(
+        dir.join(".cargo/config.toml"),
+        "[build]\nrustflags = [\"--not-a-real-flag\"]\n",
+    )
+    .unwrap();
+    let reason = blocked(&errpath(&dir, &["hook", "stop"], "{}"));
+    assert!(reason.contains("clippy (app):"), "{reason}");
+    assert!(reason.contains("not-a-real-flag"), "{reason}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Only Linux lets a directory name be bytes that aren't UTF-8.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_repository_under_a_non_utf8_path_is_still_checked() {
+    use std::os::unix::ffi::OsStrExt;
+    let name = format!("errpath-bytes-{}-", std::process::id());
+    let mut raw = name.into_bytes();
+    raw.push(0xff);
+    let dir = std::env::temp_dir().join(std::ffi::OsStr::from_bytes(&raw));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    commit(&dir, ".gitignore", "target\n");
+    commit(&dir, "Cargo.toml", PACKAGE);
+    commit(&dir, "src/lib.rs", "pub fn f() {}\n");
+
+    std::fs::write(dir.join("src/lib.rs"), "fn g() { x().unwrap(); }\n").unwrap();
+    let out = review(&dir, &["--base", "HEAD", "--format", "json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["newFindings"][0]["rule"], "no-panic", "{v}");
+
+    let input = serde_json::json!({ "tool_input": { "file_path": "src/lib.rs" } });
+    let out = errpath(&dir, &["hook", "edit"], &input.to_string());
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Cargo rejects a non-UTF-8 path, so the stop hook blocks with cargo's error.
+    let session = r#"{"session_id": "bytes"}"#;
+    let reason = blocked(&errpath(&dir, &["hook", "stop"], session));
+    assert!(reason.contains("fmt:"), "{reason}");
+    assert!(reason.contains("invalid UTF-8"), "{reason}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn stop_hook_checks_the_workspace_a_file_moved_out_of() {
+    let dir = crate_repo("hook-move");
+    commit(&dir, "src/lib.rs", "mod helper;\npub fn f() {}\n");
+    commit(&dir, "src/helper.rs", "pub fn h() {}\n");
+    commit(&dir, "nested/Cargo.toml", PACKAGE);
+    commit(&dir, "nested/src/lib.rs", "mod helper;\n");
+    // Moved into the nested crate, and staged so git can see it as a rename.
+    git(&dir, &["mv", "src/helper.rs", "nested/src/helper.rs"]);
+    let reason = blocked(&errpath(&dir, &["hook", "stop"], "{}"));
+    assert!(reason.contains("E0583"), "{reason}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_possible_finding_is_shown_but_does_not_block() {
+    let dir = crate_repo("hook-possible");
+    // errpath can't see what `send` returns: maybe a dropped error, maybe not.
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn f(tx: &std::sync::mpsc::Sender<u8>) {\n    let _ = tx.send(1);\n}\n",
+    )
+    .unwrap();
+    let input = serde_json::json!({ "tool_input": { "file_path": dir.join("src/lib.rs") } });
+    let out = errpath(&dir, &["hook", "edit"], &input.to_string());
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v = stop_json(&errpath(&dir, &["hook", "stop"], "{}"));
+    assert!(v.get("decision").is_none(), "{v}");
+    let msg = v["systemMessage"].as_str().unwrap();
+    assert!(msg.contains("not blocking"), "{msg}");
+    assert!(msg.contains("src/lib.rs:2 no-swallow"), "{msg}");
     std::fs::remove_dir_all(&dir).unwrap();
 }

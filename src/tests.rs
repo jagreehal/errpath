@@ -20,6 +20,7 @@ fn no_lines(nodes: &mut [Node]) {
             | Node::Panic { line, .. }
             | Node::Swallow { line, .. }
             | Node::Recover { line, .. }
+            | Node::Unrecorded { line, .. }
             | Node::Jump { line, .. } => *line = 0,
             Node::Convert {
                 line, conversions, ..
@@ -60,11 +61,22 @@ fn a_result_handled_without_anything_fallible_is_a_recovery() {
         arms: vec![arm.into()],
         line: 0,
     };
+    // `log` is a plain function, and `if let Ok` without `else` ignores the
+    // error: neither records it.
+    let unrecorded = |name: &str, how: &str| Node::Unrecorded {
+        name: name.into(),
+        how: how.into(),
+        line: 0,
+        confidence: Confidence::Certain,
+        allowed: None,
+    };
     assert_eq!(
         nodes(src, "f"),
         vec![
             recover("a", "if let Err", "Err(e)"),
-            recover("b", "if let Ok", "Ok(v)")
+            unrecorded("a", "if let Err"),
+            recover("b", "if let Ok", "Ok(v)"),
+            unrecorded("b", "if let Ok"),
         ]
     );
     // A handler that fails is drawn as the fork it is.
@@ -106,7 +118,11 @@ fn a_match_that_hands_the_error_back_is_a_step() {
         ),
         "j",
     );
-    assert!(matches!(j[..], [Node::Recover { .. }]), "{j:?}");
+    // `Ok(0)` stands in for the error, and nothing records it.
+    assert!(
+        matches!(j[..], [Node::Recover { .. }, Node::Unrecorded { .. }]),
+        "{j:?}"
+    );
     // Bindings on both sides: the error one goes back.
     let k = nodes(
         &format!(
@@ -405,6 +421,338 @@ fn findings_in<'a>(r: &'a Report, id: &str) -> Vec<&'a Finding> {
         .iter()
         .filter(|f| f.function.as_deref() == Some(id))
         .collect()
+}
+
+#[test]
+fn an_error_handled_without_a_trace_is_a_finding() {
+    let src = "use log::info;
+        use tracing::{debug, warn as tw};
+        fn plain() { if let Err(e) = a() { retry(); } }
+        fn printed() { if let Err(e) = a() { eprintln!(\"{e}\"); } }
+        fn matched() -> u32 { match a() { Ok(v) => v, Err(_) => 0 } }
+        fn ignored() { if let Ok(v) = a() { use_it(v); } }
+        fn ok_arm_logs() { match send() { Ok(()) => tracing::info!(\"sent\"), Err(_) => retry() } }
+        fn deferred() { if let Err(e) = a() { let later = || tracing::error!(\"{e}\"); retry(); } }
+        fn early_return() { if let Err(_) = send() { return; } done(); }
+        fn in_a_loop() { for x in xs() { if let Err(_) = send(x) { continue; } } }
+        fn log_crate() { if let Err(e) = a() { log::warn!(\"{e}\"); } }
+        fn imported_log() { if let Err(e) = a() { info!(\"{e}\"); } }
+        fn warned() { if let Err(e) = a() { tracing::warn!(error = %e, \"a failed\"); } }
+        fn imported() { if let Err(e) = a() { debug!(\"{e}\"); } }
+        fn renamed() { if let Err(e) = a() { tw!(\"{e}\"); } }
+        fn else_records() { if let Ok(v) = a() { use_it(v); } else { tracing::warn!(\"a failed\"); } }
+        fn on_span(ctx: &Ctx) { if let Err(e) = a() { ctx.record_error(&e); } }
+        fn autotel_fn() { if let Err(e) = a() { autotel::warn(\"a failed\"); } }
+        fn handed_back() -> Result<(), E> { if let Err(e) = a() { return Err(e.into()); } Ok(()) }
+        fn match_handed_back() -> Result<u32, E> { let v = match a() { Ok(v) => v, Err(e) => return Err(e) }; Ok(v) }
+        fn unresolved() { if let Err(e) = a() { error!(\"{e}\"); } }
+        fn allowed() {
+            // errpath: allow(no-trace) a miss here is retried on the next tick
+            if let Err(e) = a() { retry(); }
+        }";
+    let r = analyse(src);
+    let rules = |id: &str| -> Vec<(Confidence, Option<&str>)> {
+        findings_in(&r, id)
+            .iter()
+            .filter(|f| f.rule == NO_TRACE)
+            .map(|f| (f.confidence, f.allowed.as_deref()))
+            .collect()
+    };
+    let flagged = [
+        "plain",
+        "printed",
+        "matched",
+        "ignored",
+        "ok_arm_logs",
+        "deferred",
+        "early_return",
+        "in_a_loop",
+        "log_crate",
+        "imported_log",
+    ];
+    for id in flagged {
+        assert_eq!(rules(id), [(Confidence::Certain, None)], "{id}");
+    }
+    let recorded = [
+        "warned",
+        "imported",
+        "renamed",
+        "else_records",
+        "on_span",
+        "autotel_fn",
+        "handed_back",
+        "match_handed_back",
+    ];
+    for id in recorded {
+        assert!(rules(id).is_empty(), "{id}: {:?}", rules(id));
+    }
+    // `error!` with no `use` could be `log`'s, so it's flagged as possible.
+    assert_eq!(rules("unresolved"), [(Confidence::Possible, None)]);
+    assert_eq!(
+        rules("allowed"),
+        [(
+            Confidence::Certain,
+            Some("a miss here is retried on the next tick")
+        )]
+    );
+    let message = |id: &str| findings_in(&r, id)[0].message.clone();
+    assert_eq!(
+        message("plain"),
+        "`if let Err` handles the error from `a` without recording it"
+    );
+    assert_eq!(
+        message("ignored"),
+        "`if let Ok` ignores the error from `a` without recording it"
+    );
+    assert!(message("unresolved").contains("may be the `log` crate's"));
+}
+
+#[test]
+fn every_path_through_a_handler_must_record() {
+    let src = "fn conditional_exit() -> Result<(), E> {
+            if let Err(e) = send() { if should_fail() { return Err(e); } retry(); }
+            Ok(())
+        }
+        fn both_paths_covered() -> Result<(), E> {
+            if let Err(e) = send() { if should_fail() { return Err(e); } tracing::warn!(\"retrying\"); }
+            Ok(())
+        }
+        fn record_then_return() { if let Err(e) = send() { tracing::warn!(\"gave up\"); return; } }
+        fn return_before_record() { if let Err(e) = send() { if quiet() { return; } tracing::warn!(\"x\"); } }
+        fn fallback() -> Result<u32, E> { match a() { Ok(v) => Ok(v), Err(_) => backup() } }
+        fn fallback_try() -> Result<u32, E> { let v = match a() { Ok(v) => v, Err(_) => backup()? }; Ok(v) }
+        fn panics() { if let Err(e) = send() { panic!(\"{e}\") } }
+        fn match_inside() -> Result<(), E> {
+            if let Err(e) = send() { match kind() { Fatal => return Err(e), _ => {} } }
+            Ok(())
+        }
+        fn err_kept_local() {
+            if let Err(e) = send() { let _saved: Result<(), E> = Err(e); retry(); }
+        }
+        fn err_statement() { if let Err(e) = send() { Err::<(), _>(e); } }
+        fn short_circuit() { if let Err(e) = send() { enabled() && { tracing::warn!(\"{e}\"); true }; } }
+        fn nested_short_circuit() { if let Err(e) = send() { note(enabled() || { tracing::warn!(\"{e}\"); true }); } }
+        fn records_then_checks() { if let Err(e) = send() { tracing::warn!(\"{e}\") ; let _ = enabled() && other(); } }
+        fn records_in_args() { if let Err(e) = send() { note(span().record_error(&e)); } }
+        fn consumed_err() { if let Err(e) = send() { return discard(Err(e)); } }
+        fn consumed_by_method() -> Result<(), E> { match send() { Ok(()) => Ok(()), Err(e) => sink.take(Err(e)) } }
+        fn struct_field() {
+            if let Err(e) = send() { let c = Config { flag: if enabled() { tracing::warn!(\"{e}\"); true } else { false } }; use_it(c); }
+        }
+        fn struct_field_always() { if let Err(e) = send() { let c = Config { flag: { tracing::warn!(\"{e}\"); true } }; use_it(c); } }
+        fn struct_carrier() -> Out { match send() { Ok(()) => Out { r: Ok(()) }, Err(e) => Out { r: Err(e) } } }
+        fn exit_in_err_arg() -> Result<(), E> {
+            if let Err(e) = send() { return Err({ if skip() { return Ok(()); } e }); }
+            Ok(())
+        }
+        fn exit_in_try_arg() -> Result<(), E> { if let Err(e) = send() { Err({ if skip() { return Ok(()); } e })?; } Ok(()) }
+        fn loop_records() { if let Err(e) = send() { loop { tracing::warn!(\"{e}\"); break; } } }
+        fn loop_breaks_first() { if let Err(e) = send() { loop { if done() { break; } tracing::warn!(\"{e}\"); } } }
+        fn loop_returns() { if let Err(e) = send() { loop { if done() { return; } tracing::warn!(\"{e}\"); break; } } }
+        fn loop_retries() { if let Err(e) = send() { loop { if again() { continue; } tracing::warn!(\"{e}\"); break; } } }
+        fn while_may_skip() { if let Err(e) = send() { while more() { tracing::warn!(\"{e}\"); } } }
+        fn while_cond_records() { if let Err(e) = send() { while { tracing::warn!(\"{e}\"); more() } { step(); } } }
+        fn for_may_skip() { if let Err(e) = send() { for x in xs() { tracing::warn!(\"{x}\"); } } }
+        fn generic_err() -> Result<(), E> { if let Err(e) = send() { return Err::<(), E>(e); } Ok(()) }
+        fn qualified_err() -> Result<(), E> { if let Err(e) = send() { return std::result::Result::Err(e); } Ok(()) }
+        fn result_err() -> Result<(), E> { match send() { Ok(()) => Ok(()), Err(e) => Result::Err(e) } }
+        fn alias_err() -> R<()> { if let Err(e) = send() { return R::Err(e); } Ok(()) }
+        fn io_result_err() -> io::Result<()> { match send() { Ok(()) => Ok(()), Err(e) => io::Result::Err(e) } }
+        fn renamed_err() -> Result<(), E> { use std::result::Result::Err as Fail; if let Err(e) = send() { return Fail(e); } Ok(()) }
+        fn renamed_other() -> Result<(), E> { use other::wrap as Fail; if let Err(e) = send() { return Fail(e); } Ok(()) }
+        fn exit_in_macro_arg() { if let Err(e) = send() { println!(\"{}\", { if skip() { return; } 1 }); tracing::warn!(\"{e}\"); } }
+        fn try_in_macro_arg() -> Result<(), E> { if let Err(e) = send() { println!(\"{}\", backup()?); tracing::warn!(\"{e}\"); } Ok(()) }
+        fn short_circuit_in_macro() { if let Err(e) = send() { assert!(ok() || { tracing::warn!(\"{e}\"); true }); } }
+        fn records_in_macro_arg() { if let Err(e) = send() { println!(\"{}\", span().record_error(&e)); } }
+        fn records_in_debug_assert() { if let Err(e) = send() { debug_assert!(span().record_error(&e)); } }
+        fn try_unwraps_ok() { if let Err(e) = send() { let _saved: Result<(), ()> = Ok::<_, ()>(Err::<(), _>(e))?; } }
+        fn try_err() -> Result<(), E> { if let Err(e) = send() { Err::<(), _>(e)?; } Ok(()) }
+        fn guard_exits() {
+            if let Err(e) = send() {
+                match 0 { _ if { if skip() { return; } true } => tracing::warn!(\"{e}\"), _ => tracing::warn!(\"{e}\") }
+            }
+        }
+        fn guard_records() {
+            if let Err(e) = send() { match 0 { _ if { tracing::warn!(\"{e}\"); true } => {}, _ => tracing::warn!(\"{e}\") } }
+        }
+        fn stringified() { if let Err(e) = send() { let _text = stringify!({ tracing::warn!(\"{e}\"); 1 }); } }
+        fn unknown_macro_exit() { if let Err(e) = send() { my_macro!({ return; }); tracing::warn!(\"{e}\"); } }
+        fn assert_message() { if let Err(e) = send() { assert!(true, \"{}\", { tracing::warn!(\"{e}\"); \"failed\" }); } }
+        fn assert_eq_message() { if let Err(e) = send() { assert_eq!(1, 1, \"{}\", { tracing::warn!(\"{e}\"); \"x\" }); } }
+        fn assert_condition() { if let Err(e) = send() { assert!({ tracing::warn!(\"{e}\"); true }, \"msg\"); } }
+        fn guard_falls_through() { if let Err(e) = send() { match 0 { _ if { tracing::warn!(\"{e}\"); false } => {}, _ => {} } } }
+        fn guard_may_not_run() { if let Err(e) = send() { match k() { Some(_) if { tracing::warn!(\"{e}\"); false } => {}, _ => {} } } }
+        fn range_end() { if let Err(e) = send() { let _r = 0..if enabled() { tracing::warn!(\"{e}\"); 1 } else { 0 }; } }
+        fn repeat_elem() { if let Err(e) = send() { let _a = [if enabled() { tracing::warn!(\"{e}\"); 1 } else { 0 }; 4]; } }
+        fn range_records() { if let Err(e) = send() { let _r = { tracing::warn!(\"{e}\"); 0 }..1; } }
+        fn autotel_call() { if let Err(e) = send() { autotel::warn(&e); } }
+        fn direct_exit_in_log_arg() { if let Err(e) = send() { tracing::warn!(\"{}\", { if quit() { return; } e }); } }
+        fn renamed_exit_in_log_arg() { use tracing::warn as tw; if let Err(e) = send() { tw!(\"{}\", { if quit() { return; } e }); } }
+        fn renamed_log() { use tracing::warn as tw; if let Err(e) = send() { tw!(\"{}\", e); } }
+        fn renamed_panic() { use std::panic as boom; if let Err(e) = send() { boom!(\"{e}\"); } }
+        fn direct_guard_try() -> Result<(), E> {
+            match send() { Err(e) if should_retry()? => tracing::warn!(\"{e}\"), Err(e) => tracing::warn!(\"{e}\"), Ok(()) => () }
+            Ok(())
+        }
+        fn direct_guard_return() {
+            match send() { Err(e) if { if quit() { return; } true } => tracing::warn!(\"{e}\"), Err(e) => tracing::warn!(\"{e}\"), Ok(()) => () }
+        }
+        fn direct_guard_fine() {
+            match send() { Err(e) if transient(&e) => tracing::warn!(\"retry {e}\"), Err(e) => tracing::error!(\"{e}\"), Ok(()) => () }
+        }
+        fn direct_guard_records() {
+            match send() { Err(e) if { tracing::warn!(\"{e}\"); false } => {}, Err(_) => {}, Ok(()) => () }
+        }
+        fn direct_guard_handed_back() -> Result<(), E> {
+            match send() { Ok(()) => Ok(()), Err(e) if { if quit() { return Ok(()); } true } => Err(e), Err(e) => Err(e) }
+        }
+        fn direct_guard_kind_records() {
+            match send() { Err(Kind::A) if { tracing::warn!(\"a\"); false } => {}, Err(_) => {}, Ok(()) => () }
+        }
+        fn wrapped_err() -> Poll<Result<(), E>> { match send() { Ok(()) => Poll::Ready(Ok(())), Err(e) => Poll::Ready(Err(e)) } }
+        fn err_as_value() -> Result<(), E> { match send() { Ok(()) => Ok(()), Err(e) => { retry(); Err(e) } } }";
+    let r = analyse(src);
+    let flagged = |id: &str| findings_in(&r, id).iter().any(|f| f.rule == NO_TRACE);
+    for id in [
+        "conditional_exit",
+        "return_before_record",
+        "fallback",
+        "fallback_try",
+        "match_inside",
+        "err_kept_local",
+        "err_statement",
+        "short_circuit",
+        "nested_short_circuit",
+        "consumed_err",
+        "consumed_by_method",
+        "struct_field",
+        "exit_in_err_arg",
+        "exit_in_try_arg",
+        "loop_breaks_first",
+        "loop_returns",
+        "while_may_skip",
+        "for_may_skip",
+        "renamed_other",
+        "exit_in_macro_arg",
+        "try_in_macro_arg",
+        "short_circuit_in_macro",
+        "records_in_debug_assert",
+        "try_unwraps_ok",
+        "guard_exits",
+        "stringified",
+        "assert_message",
+        "assert_eq_message",
+        "guard_may_not_run",
+        "range_end",
+        "repeat_elem",
+        "direct_exit_in_log_arg",
+        "renamed_exit_in_log_arg",
+        "direct_guard_try",
+        "direct_guard_return",
+        "direct_guard_handed_back",
+        "direct_guard_kind_records",
+    ] {
+        assert!(flagged(id), "{id} should be flagged");
+    }
+    for id in [
+        "both_paths_covered",
+        "record_then_return",
+        "panics",
+        "records_then_checks",
+        "records_in_args",
+        "err_as_value",
+        "wrapped_err",
+        "struct_field_always",
+        "struct_carrier",
+        "loop_records",
+        "loop_retries",
+        "while_cond_records",
+        "generic_err",
+        "qualified_err",
+        "result_err",
+        "alias_err",
+        "io_result_err",
+        "renamed_err",
+        "records_in_macro_arg",
+        "try_err",
+        "guard_records",
+        "unknown_macro_exit",
+        "assert_condition",
+        "guard_falls_through",
+        "range_records",
+        "autotel_call",
+        "renamed_log",
+        "renamed_panic",
+        "direct_guard_fine",
+        "direct_guard_records",
+    ] {
+        assert!(r.functions.iter().any(|f| f.id == id), "{id} missing");
+        assert!(!flagged(id), "{id}: {:?}", findings_in(&r, id));
+    }
+}
+
+#[test]
+fn imports_resolve_in_their_own_module() {
+    let src = "mod uses_log {
+            use log::warn;
+            fn f() { if let Err(e) = a() { warn!(\"{e}\"); } }
+        }
+        mod uses_tracing {
+            use tracing::warn;
+            fn f() { if let Err(e) = a() { warn!(\"{e}\"); } }
+            mod child {
+                fn f() { if let Err(e) = a() { warn!(\"{e}\"); } }
+            }
+        }
+        use tracing as t;
+        fn aliased() { if let Err(e) = a() { t::warn!(\"{e}\"); } }
+        fn fn_local() { use tracing::info; if let Err(e) = a() { info!(\"{e}\"); } }
+        fn fn_local_log() { use log::info; if let Err(e) = a() { info!(\"{e}\"); } }
+        impl S {
+            fn method(&self) { if let Err(e) = a() { t::error!(\"{e}\"); } }
+        }
+        fn block_shadow() {
+            use log::warn;
+            { use tracing::warn; warn!(\"startup\"); }
+            if let Err(e) = a() { warn!(\"{e}\"); }
+        }
+        fn block_local() {
+            use log::warn;
+            { use tracing::warn; if let Err(e) = a() { warn!(\"{e}\"); } }
+        }
+        fn handler_block_local() {
+            if let Err(e) = a() { use tracing::warn; warn!(\"{e}\"); }
+        }";
+    let r = analyse(src);
+    let confidence = |id: &str| {
+        findings_in(&r, id)
+            .iter()
+            .find(|f| f.rule == NO_TRACE)
+            .map(|f| f.confidence)
+    };
+    let ids: Vec<_> = r.functions.iter().map(|f| f.id.as_str()).collect();
+    for id in ["uses_tracing::f", "aliased", "fn_local", "S::method"] {
+        assert!(ids.contains(&id), "{id} not in {ids:?}");
+    }
+    // `log`'s warn, whatever another module imports.
+    assert_eq!(confidence("uses_log::f"), Some(Confidence::Certain));
+    assert_eq!(confidence("uses_tracing::f"), None);
+    // A child module doesn't inherit its parent's `use` items.
+    assert_eq!(
+        confidence("uses_tracing::child::f"),
+        Some(Confidence::Possible)
+    );
+    assert_eq!(confidence("aliased"), None);
+    assert_eq!(confidence("fn_local"), None);
+    assert_eq!(confidence("fn_local_log"), Some(Confidence::Certain));
+    assert_eq!(confidence("S::method"), None);
+    // A block's `use` items stay in the block.
+    assert_eq!(confidence("block_shadow"), Some(Confidence::Certain));
+    assert_eq!(confidence("block_local"), None);
+    assert_eq!(confidence("handler_block_local"), None);
+    for id in ["block_shadow", "block_local", "handler_block_local"] {
+        assert!(ids.contains(&id), "{id} not in {ids:?}");
+    }
 }
 
 #[test]
@@ -919,6 +1267,15 @@ mod review {
         let r = diff(BASE, &head);
         assert_eq!(r.risk, Risk::Moderate);
         assert_eq!(r.functions[0].added[0].kind, ItemKind::Recover);
+        // `log` is a plain function: nothing reaches a trace.
+        assert_eq!(r.new_findings[0].finding.rule, NO_TRACE);
+        assert_eq!(r.new_findings[0].severity, "warning");
+
+        // Recording it clears the finding.
+        let traced = head.replace("log(e);", "tracing::warn!(error = %e);");
+        assert!(diff(BASE, &traced).new_findings.is_empty());
+        // And dropping the record later is new.
+        assert_eq!(diff(&traced, &head).new_findings[0].finding.rule, NO_TRACE);
         assert!(
             r.markdown.contains("handled error from `a`"),
             "{}",
@@ -2060,4 +2417,26 @@ mod review {
         }
         assert_eq!(f["line"], 1);
     }
+}
+
+#[test]
+fn renamed_panic_macros_still_panic() {
+    let src = "fn direct() { if let Err(e) = send() { panic!(\"{e:?}\"); } }
+        fn renamed() { use std::panic as boom; if let Err(e) = send() { boom!(\"{e:?}\"); } }
+        mod m {
+            use std::panic as boom;
+            fn in_block() { { if let Err(e) = send() { boom!(\"{e:?}\"); } } }
+        }
+        fn block_rename() { { use std::unreachable as never; never!(); } }
+        fn not_a_panic() { boom!(); }";
+    let r = analyse(src);
+    let rules = |id: &str| -> Vec<String> {
+        assert!(r.functions.iter().any(|f| f.id == id), "{id} missing");
+        findings_in(&r, id).iter().map(|f| f.rule.clone()).collect()
+    };
+    for id in ["direct", "renamed", "m::in_block", "block_rename"] {
+        assert_eq!(rules(id), [NO_PANIC], "{id}");
+    }
+    // Unresolved, `boom!` is some other macro.
+    assert!(rules("not_a_panic").is_empty());
 }

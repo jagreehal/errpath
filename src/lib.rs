@@ -20,8 +20,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 pub const NO_PANIC: &str = "no-panic";
 pub const NO_SWALLOW: &str = "no-swallow";
+pub const NO_TRACE: &str = "no-trace";
 pub const BAD_ALLOW: &str = "bad-allow";
-const ALLOWABLE: &[&str] = &[NO_PANIC, NO_SWALLOW];
+const ALLOWABLE: &[&str] = &[NO_PANIC, NO_SWALLOW, NO_TRACE];
 
 #[derive(Debug, PartialEq, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +119,18 @@ pub enum Node {
         /// The patterns and guards, which decide what gets handled.
         arms: Vec<String>,
         line: usize,
+    },
+    /// The handler of an error stops it without recording it anywhere
+    /// OpenTelemetry can see: no `tracing` event, nothing on a span. It goes
+    /// right after the recovery or fork it belongs to, and draws as nothing.
+    Unrecorded {
+        name: String,
+        how: String,
+        line: usize,
+        /// `Possible` when the handler logs with a macro whose crate syntax
+        /// can't resolve, like a bare `warn!` with no `use`.
+        confidence: Confidence,
+        allowed: Option<String>,
     },
 }
 
@@ -252,6 +265,11 @@ struct Collector<'ast> {
     /// `?` in macros outside any fn, e.g. `ffi_fn! { fn f() { a()?; } }`.
     item_macro_try: usize,
     fn_depth: usize,
+    /// `use` items by the scope they sit in, to tell `tracing::warn!` from `log::warn!`.
+    imports: Scopes,
+    /// Blocks inside the current fn body: their `use` items are read where
+    /// they apply, by `block_uses`.
+    blocks: usize,
 }
 
 impl<'ast> Collector<'ast> {
@@ -266,7 +284,9 @@ impl<'ast> Collector<'ast> {
         self.path.push(sig.ident.to_string());
         let owner = self.owner.take();
         self.fn_depth += 1;
-        self.visit_block(block);
+        let blocks = std::mem::take(&mut self.blocks);
+        block.stmts.iter().for_each(|s| self.visit_stmt(s));
+        self.blocks = blocks;
         self.fn_depth -= 1;
         self.owner = owner;
         self.path.pop();
@@ -275,13 +295,29 @@ impl<'ast> Collector<'ast> {
     fn within(&mut self, segment: String, owner: Option<String>, f: impl FnOnce(&mut Self)) {
         self.path.push(segment);
         let saved = std::mem::replace(&mut self.owner, owner);
+        let blocks = std::mem::take(&mut self.blocks);
         f(self);
+        self.blocks = blocks;
         self.owner = saved;
         self.path.pop();
     }
 }
 
 impl<'ast> Visit<'ast> for Collector<'ast> {
+    fn visit_block(&mut self, b: &'ast Block) {
+        self.blocks += 1;
+        visit::visit_block(self, b);
+        self.blocks -= 1;
+    }
+
+    fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
+        if self.blocks > 0 {
+            return;
+        }
+        let scope = self.imports.names.entry(self.path.clone()).or_default();
+        scope.add(&u.tree, &mut vec![]);
+    }
+
     fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
         if !is_test(&f.attrs) {
             self.add(&f.sig, Some(&f.block));
@@ -304,6 +340,9 @@ impl<'ast> Visit<'ast> for Collector<'ast> {
             if m.content.is_none() && self.path.is_empty() {
                 self.mods.push(m.ident.to_string());
             }
+            let mut module = self.path.clone();
+            module.push(m.ident.to_string());
+            self.imports.modules.insert(module);
             self.within(m.ident.to_string(), None, |c| visit::visit_item_mod(c, m));
         } else if m.content.is_none() {
             self.test_mods.push(m.ident.to_string());
@@ -993,6 +1032,608 @@ impl<'ast> Visit<'ast> for Locals {
     }
 }
 
+/// How sure we are that an error handler records what it stops.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+enum Recorded {
+    No,
+    /// Only through a logging macro whose crate can't be resolved.
+    Maybe,
+    Yes,
+}
+
+/// One scope's `use` items: a module, or a fn body.
+#[derive(Default)]
+struct Imports {
+    /// Name in scope → (root crate, original name).
+    names: HashMap<String, (String, String)>,
+    /// Roots of `use x::*`.
+    globs: Vec<String>,
+}
+
+impl Imports {
+    fn add(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
+        let root = |prefix: &[String], own: &syn::Ident| {
+            prefix.first().cloned().unwrap_or_else(|| own.to_string())
+        };
+        match tree {
+            syn::UseTree::Path(p) => {
+                prefix.push(p.ident.to_string());
+                self.add(&p.tree, prefix);
+                prefix.pop();
+            }
+            syn::UseTree::Name(n) => {
+                let entry = (root(prefix, &n.ident), n.ident.to_string());
+                self.names.insert(n.ident.to_string(), entry);
+            }
+            syn::UseTree::Rename(r) => {
+                let entry = (root(prefix, &r.ident), r.ident.to_string());
+                self.names.insert(r.rename.to_string(), entry);
+            }
+            syn::UseTree::Glob(_) => self.globs.extend(prefix.first().cloned()),
+            syn::UseTree::Group(g) => g.items.iter().for_each(|t| self.add(t, prefix)),
+        }
+    }
+}
+
+/// A file's `use` items by scope. Keys are collector paths: modules, impl
+/// types and fns. Only modules are marked, since only they stop a lookup.
+#[derive(Default)]
+struct Scopes {
+    names: HashMap<Vec<String>, Imports>,
+    modules: HashSet<Vec<String>>,
+}
+
+impl Scopes {
+    /// What a fn at `path` named `name` can see, innermost first: its own
+    /// body, any fns around it, then its module. As in rustc, a module's
+    /// `use` items stop at the module: a child module doesn't inherit them.
+    fn chain(&self, path: &[String], name: &str) -> Vec<&Imports> {
+        let mut own = path.to_vec();
+        own.push(name.to_string());
+        let mut chain: Vec<&Imports> = self.names.get(&own).into_iter().collect();
+        let mut at = path.to_vec();
+        loop {
+            chain.extend(self.names.get(&at));
+            if at.is_empty() || self.modules.contains(&at) {
+                return chain;
+            }
+            at.pop();
+        }
+    }
+}
+
+/// A nested block's own `use` items, in scope only inside it.
+fn block_uses(b: &Block) -> Imports {
+    let mut imports = Imports::default();
+    for s in &b.stmts {
+        if let Stmt::Item(syn::Item::Use(u)) = s {
+            imports.add(&u.tree, &mut vec![]);
+        }
+    }
+    imports
+}
+
+/// The crate a macro comes from, and its original name, through the `use`
+/// items in scope: `warn!` after `use tracing::warn`, or `t::warn!` after
+/// `use tracing as t`.
+fn resolve(chain: &[&Imports], path: &syn::Path) -> (Option<String>, String) {
+    let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    let lookup = |name: &str| chain.iter().find_map(|i| i.names.get(name));
+    match &segments[..] {
+        [name] => match lookup(name) {
+            Some((root, original)) => (Some(root.clone()), original.clone()),
+            None => {
+                // Only an unambiguous glob decides.
+                let globs: HashSet<&str> = chain
+                    .iter()
+                    .flat_map(|i| &i.globs)
+                    .map(String::as_str)
+                    .filter(|g| ["tracing", "log"].contains(g))
+                    .collect();
+                let root = (globs.len() == 1)
+                    .then(|| globs.iter().next().map(|g| g.to_string()))
+                    .flatten();
+                (root, name.clone())
+            }
+        },
+        [first, .., name] => {
+            let root = lookup(first).map_or_else(|| first.clone(), |(root, _)| root.clone());
+            (Some(root), name.clone())
+        }
+        [] => (None, String::new()),
+    }
+}
+
+/// Standard macros that evaluate each argument as an expression.
+const RUNS_ARGUMENTS: [&str; 13] = [
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "format",
+    "format_args",
+    "write",
+    "writeln",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "dbg",
+    "vec",
+];
+
+/// Span methods that record onto the current trace.
+const RECORDING_METHODS: [&str; 5] = [
+    "record_error",
+    "record_exception",
+    "add_event",
+    "set_status",
+    "record",
+];
+
+/// How well a logging macro records: `tracing`'s do, `log`'s don't, and an
+/// unresolved bare name may be either. Anything else records nothing.
+fn macro_records(imports: &[&Imports], path: &syn::Path) -> Recorded {
+    let (root, name) = resolve(imports, path);
+    if !["error", "warn", "info", "debug", "trace", "event"].contains(&name.as_str()) {
+        return Recorded::No;
+    }
+    match root.as_deref() {
+        Some("tracing") => Recorded::Yes,
+        Some("log") => Recorded::No,
+        _ => Recorded::Maybe,
+    }
+}
+
+/// `Err`, `Err::<T, E>`, `Result::Err`, `std::result::Result::Err`, or
+/// through an alias of `Result` (`io::Result::Err`, `type R = ..; R::Err`)
+/// or a rename (`use Result::Err as Fail; Fail(e)`).
+fn is_err_ctor(imports: &[&Imports], path: &syn::Path) -> bool {
+    match path.segments.iter().collect::<Vec<_>>()[..] {
+        [one] => {
+            let name = one.ident.to_string();
+            match imports.iter().find_map(|i| i.names.get(&name)) {
+                Some((_, original)) => original == "Err",
+                None => name == "Err",
+            }
+        }
+        [.., last] => last.ident == "Err",
+        [] => false,
+    }
+}
+
+/// `_`, a lowercase binding, or a tuple of them: a pattern that can't fail.
+fn always_matches(p: &syn::Pat) -> bool {
+    match p {
+        syn::Pat::Wild(_) => true,
+        syn::Pat::Ident(i) => {
+            i.subpat.is_none()
+                && i.ident
+                    .to_string()
+                    .starts_with(|c: char| c.is_lowercase() || c == '_')
+        }
+        syn::Pat::Paren(p) => always_matches(&p.pat),
+        syn::Pat::Tuple(t) => t.elems.iter().all(always_matches),
+        _ => false,
+    }
+}
+
+/// `Err(e)`, `Err(_)`: every error.
+fn any_err(p: &syn::Pat) -> bool {
+    matches!(p, syn::Pat::TupleStruct(t)
+        if t.path.segments.last().is_some_and(|s| s.ident == "Err")
+            && t.elems.len() == 1
+            && t.elems.iter().all(always_matches))
+}
+
+/// `Err(..)` itself, not wrapped.
+fn is_err_call(imports: &[&Imports], e: &Expr) -> bool {
+    match e {
+        Expr::Paren(p) => is_err_call(imports, &p.expr),
+        Expr::Group(g) => is_err_call(imports, &g.expr),
+        Expr::Call(c) => matches!(&*c.func, Expr::Path(p) if is_err_ctor(imports, &p.path)),
+        _ => false,
+    }
+}
+
+/// `Err(..)`, alone or wrapped in a constructor, tuple, array or struct
+/// (`Poll::Ready(Err(e))`, `(Err(e), buf)`): the error carried on as a value.
+/// A plain function call (`discard(Err(e))`) may consume it, so it doesn't count.
+fn is_err_value(imports: &[&Imports], e: &Expr) -> bool {
+    let err = |e: &Expr| is_err_value(imports, e);
+    match e {
+        Expr::Paren(p) => err(&p.expr),
+        Expr::Group(g) => err(&g.expr),
+        Expr::Call(c) => match &*c.func {
+            Expr::Path(p) if is_err_ctor(imports, &p.path) => true,
+            // An enum variant or tuple struct: by convention, capitalised.
+            Expr::Path(p) => {
+                p.path.segments.last().is_some_and(|s| {
+                    s.ident
+                        .to_string()
+                        .starts_with(|ch: char| ch.is_ascii_uppercase())
+                }) && c.args.iter().any(err)
+            }
+            _ => false,
+        },
+        Expr::Tuple(t) => t.elems.iter().any(err),
+        Expr::Array(a) => a.elems.iter().any(err),
+        Expr::Struct(s) => s.fields.iter().any(|f| err(&f.expr)),
+        _ => false,
+    }
+}
+
+/// Where the paths through some code go, and how well each records the error.
+#[derive(Clone, Copy, Default)]
+struct Paths {
+    /// The worst-recorded path that leaves the handler early: `return`, `?`,
+    /// or a `break` or `continue` out of it.
+    left: Option<Recorded>,
+    /// The worst-recorded `break` out of the innermost loop in the handler.
+    broke: Option<Recorded>,
+    /// The worst-recorded path that reaches the end, or `None` if none does.
+    falls: Option<Recorded>,
+}
+
+impl Paths {
+    fn falls(at: Recorded) -> Self {
+        Paths {
+            falls: Some(at),
+            ..Self::default()
+        }
+    }
+
+    fn leaves(at: Recorded) -> Self {
+        Paths {
+            left: Some(at),
+            ..Self::default()
+        }
+    }
+
+    /// Adds another piece of code's early exits to these.
+    fn exits(&mut self, other: Paths) {
+        self.left = worst(self.left, other.left);
+        self.broke = worst(self.broke, other.broke);
+    }
+}
+
+fn worst(a: Option<Recorded>, b: Option<Recorded>) -> Option<Recorded> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, None) | (None, a) => a,
+    }
+}
+
+/// Follows every path through an error handler, so one exit that hands the
+/// error on doesn't excuse another that drops it.
+struct Flow<'a> {
+    imports: &'a [&'a Imports],
+    /// Inside a loop that's inside the handler, so `break` stays in the handler.
+    looping: bool,
+}
+
+impl Flow<'_> {
+    fn handler(&self, e: &Expr) -> Recorded {
+        let p = self.expr(e, Recorded::No, true);
+        worst(p.left, p.falls).unwrap_or(Recorded::Yes) // never ends: nothing dropped
+    }
+
+    fn handler_block(&self, b: &Block) -> Recorded {
+        let p = self.block(b, Recorded::No, true);
+        worst(p.left, p.falls).unwrap_or(Recorded::Yes)
+    }
+
+    /// `value`: whether the code's value leaves the handler, so an `Err(..)`
+    /// there hands the error on rather than holding it in a local.
+    fn block(&self, b: &Block, level: Recorded, value: bool) -> Paths {
+        let local = block_uses(b);
+        if local.names.is_empty() && local.globs.is_empty() {
+            return self.stmts(b, level, value);
+        }
+        let chain: Vec<&Imports> = std::iter::once(&local)
+            .chain(self.imports.iter().copied())
+            .collect();
+        Flow {
+            imports: &chain,
+            looping: self.looping,
+        }
+        .stmts(b, level, value)
+    }
+
+    fn stmts(&self, b: &Block, mut level: Recorded, value: bool) -> Paths {
+        let mut out = Paths::default();
+        let n = b.stmts.len();
+        for (i, stmt) in b.stmts.iter().enumerate() {
+            let p = match stmt {
+                Stmt::Expr(e, None) if i + 1 == n => self.expr(e, level, value),
+                Stmt::Expr(e, _) => self.expr(e, level, false),
+                Stmt::Macro(m) => self.mac(&m.mac, level),
+                Stmt::Local(l) => {
+                    let Some(init) = &l.init else { continue };
+                    let mut p = self.expr(&init.expr, level, false);
+                    if let (Some((_, other)), Some(at)) = (&init.diverge, p.falls) {
+                        let e = self.expr(other, at, false);
+                        p.exits(e);
+                        p.left = worst(p.left, e.falls);
+                    }
+                    p
+                }
+                Stmt::Item(_) => continue,
+            };
+            out.exits(p);
+            match p.falls {
+                Some(at) => level = at,
+                None => return out,
+            }
+        }
+        out.falls = Some(level);
+        out
+    }
+
+    /// The arguments of a macro known to run them (`println!`, `assert!`,
+    /// `format!` ..) run first, when they parse as expressions. Any other
+    /// macro's tokens may not run at all (`stringify!`), so they're skipped.
+    /// A logging or `debug_` macro's may not run, so they can't record, only leave.
+    fn mac(&self, m: &syn::Macro, level: Recorded) -> Paths {
+        // The original name, through any rename: `use tracing::warn as tw`.
+        let name = resolve(self.imports, &m.path).1;
+        let panics = PANIC_MACROS.contains(&name.as_str());
+        let logs = ["error", "warn", "info", "debug", "trace", "event"].contains(&name.as_str());
+        let maybe = logs || name.starts_with("debug_assert");
+        let runs = maybe || RUNS_ARGUMENTS.contains(&name.as_str()) || panics;
+        let parsed = runs
+            .then(|| m.parse_body_with(Punctuated::<Expr, syn::Token![,]>::parse_terminated))
+            .and_then(Result::ok);
+        // An assertion's message runs only when it fails.
+        let always = match name.as_str() {
+            "assert" => 1,
+            "assert_eq" | "assert_ne" => 2,
+            _ => usize::MAX,
+        };
+        let mut p = match parsed {
+            Some(args) => {
+                let mut p = self.seq(args.iter().take(always), level);
+                if let Some(at) = p.falls {
+                    let message = self.seq(args.iter().skip(always), at);
+                    p.exits(message);
+                    p.falls = worst(Some(at), message.falls);
+                }
+                p
+            }
+            None => Paths::falls(level),
+        };
+        if maybe {
+            p.falls = worst(Some(level), p.falls);
+        }
+        if panics {
+            p.left = worst(p.left, p.falls.map(|_| Recorded::Yes));
+            p.falls = None;
+            return p;
+        }
+        p.falls = p
+            .falls
+            .map(|at| at.max(macro_records(self.imports, &m.path)));
+        p
+    }
+
+    /// Expressions in the order they run, each starting where the last ended.
+    fn seq<'e>(&self, es: impl IntoIterator<Item = &'e Expr>, mut level: Recorded) -> Paths {
+        let mut out = Paths::default();
+        for e in es {
+            let p = self.expr(e, level, false);
+            out.exits(p);
+            match p.falls {
+                Some(at) => level = at,
+                None => return out,
+            }
+        }
+        out.falls = Some(level);
+        out
+    }
+
+    /// A loop body. A path that reaches its end runs it again from a level
+    /// no lower, so the first pass's exits are the worst there are.
+    fn body(&self, b: &Block, level: Recorded) -> Paths {
+        Flow {
+            imports: self.imports,
+            looping: true,
+        }
+        .block(b, level, false)
+    }
+
+    fn expr(&self, e: &Expr, level: Recorded, value: bool) -> Paths {
+        match e {
+            // Its parts run first, and may leave without it.
+            _ if value && is_err_value(self.imports, e) => {
+                let mut p = self.expr(e, level, false);
+                p.falls = p.falls.map(|_| Recorded::Yes);
+                p
+            }
+            Expr::Return(r) => match &r.expr {
+                Some(v) => {
+                    let p = self.expr(v, level, true);
+                    Paths {
+                        left: worst(p.left, p.falls),
+                        broke: p.broke,
+                        falls: None,
+                    }
+                }
+                None => Paths::leaves(level),
+            },
+            // A labelled one may leave the handler: count it as leaving.
+            Expr::Break(b) if self.looping && b.label.is_none() => {
+                let mut p = match &b.expr {
+                    Some(v) => self.expr(v, level, false),
+                    None => Paths::falls(level),
+                };
+                p.broke = worst(p.broke, p.falls);
+                p.falls = None;
+                p
+            }
+            // Back to the top of the loop, at a level no lower.
+            Expr::Continue(c) if self.looping && c.label.is_none() => Paths::default(),
+            Expr::Break(_) | Expr::Continue(_) => Paths::leaves(level),
+            Expr::Macro(m) => self.mac(&m.mac, level),
+            // `Err(e)?` hands `e` on; `Ok(Err(e))?` unwraps the `Ok` and keeps it.
+            Expr::Try(t) if is_err_call(self.imports, &t.expr) => {
+                let p = self.expr(&t.expr, level, false);
+                Paths {
+                    left: worst(p.left, p.falls.map(|_| Recorded::Yes)),
+                    broke: p.broke,
+                    falls: None,
+                }
+            }
+            // `fallback()?` leaves with another error: this one is dropped.
+            Expr::Try(t) => {
+                let mut p = self.expr(&t.expr, level, false);
+                p.left = worst(p.left, p.falls);
+                p
+            }
+            Expr::If(i) => {
+                let mut out = self.expr(&i.cond, level, false);
+                let Some(at) = out.falls else { return out };
+                let then = self.block(&i.then_branch, at, value);
+                let other = match &i.else_branch {
+                    Some((_, e)) => self.expr(e, at, value),
+                    None => Paths::falls(at),
+                };
+                out.exits(then);
+                out.exits(other);
+                out.falls = worst(then.falls, other.falls);
+                out
+            }
+            Expr::Match(m) => {
+                let mut out = self.expr(&m.expr, level, false);
+                let Some(at) = out.falls.take() else {
+                    return out;
+                };
+                let arms = self.match_arms(m.arms.iter().map(|a| (a, false)), at, value, false);
+                out.exits(arms);
+                out.falls = arms.falls;
+                out
+            }
+            Expr::Block(b) => self.block(&b.block, level, value),
+            Expr::Unsafe(u) => self.block(&u.block, level, value),
+            Expr::Paren(p) => self.expr(&p.expr, level, value),
+            Expr::Group(g) => self.expr(&g.expr, level, value),
+            // `a && b`, `a || b`: `b` may not run.
+            Expr::Binary(b) if matches!(b.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) => {
+                let mut out = self.expr(&b.left, level, false);
+                let Some(at) = out.falls else { return out };
+                let r = self.expr(&b.right, at, false);
+                out.exits(r);
+                out.falls = worst(Some(at), r.falls);
+                out
+            }
+            Expr::Binary(b) => self.seq([&*b.left, &*b.right], level),
+            Expr::Assign(a) => self.seq([&*a.right, &*a.left], level),
+            Expr::Call(c) => self.seq(std::iter::once(&*c.func).chain(&c.args), level),
+            Expr::MethodCall(m) => {
+                let mut p = self.seq(std::iter::once(&*m.receiver).chain(&m.args), level);
+                if RECORDING_METHODS.contains(&m.method.to_string().as_str()) {
+                    p.falls = p.falls.map(|_| Recorded::Yes);
+                }
+                p
+            }
+            Expr::Unary(u) => self.expr(&u.expr, level, false),
+            Expr::Reference(r) => self.expr(&r.expr, level, false),
+            Expr::Field(f) => self.expr(&f.base, level, false),
+            Expr::Cast(c) => self.expr(&c.expr, level, false),
+            Expr::Await(a) => self.expr(&a.base, level, false),
+            Expr::Let(l) => self.expr(&l.expr, level, false),
+            Expr::Index(i) => self.seq([&*i.expr, &*i.index], level),
+            Expr::Tuple(t) => self.seq(&t.elems, level),
+            Expr::Array(a) => self.seq(&a.elems, level),
+            Expr::Struct(s) => self.seq(
+                s.fields.iter().map(|f| &f.expr).chain(s.rest.as_deref()),
+                level,
+            ),
+            // `loop` runs its body at least once and ends only by `break`.
+            Expr::Loop(l) => {
+                let b = self.body(&l.body, level);
+                Paths {
+                    left: b.left,
+                    broke: None,
+                    falls: b.broke,
+                }
+            }
+            // `while` and `for` may run their body no times.
+            Expr::While(w) => self.maybe_looped(&w.cond, &w.body, level),
+            Expr::ForLoop(f) => self.maybe_looped(&f.expr, &f.body, level),
+            Expr::Range(r) => self.seq(r.start.iter().chain(&r.end).map(|e| &**e), level),
+            // The length is a constant, worked out at compile time.
+            Expr::Repeat(r) => self.expr(&r.expr, level, false),
+            Expr::RawAddr(r) => self.expr(&r.expr, level, false),
+            Expr::Yield(y) => self.seq(y.expr.as_deref(), level),
+            // A `?` inside `try { .. }` counts as leaving the handler.
+            Expr::TryBlock(t) => self.block(&t.block, level, false),
+            // Any call through `autotel` records.
+            Expr::Path(p) if p.path.segments.iter().any(|s| s.ident == "autotel") => {
+                Paths::falls(Recorded::Yes)
+            }
+            // Closures and async blocks may never run; a `const` block runs at
+            // compile time; the rest (paths, literals ..) run nothing.
+            _ => Paths::falls(level),
+        }
+    }
+
+    /// A match's arms, in order, from `at`. An arm marked as handing the
+    /// error back records whatever its body does. `on_err`: only the error
+    /// path is followed, so `Err(e)` always matches. The level the next arm is
+    /// tried at: a guard that ran and failed passes its level on, at worst the
+    /// level before it, unless its pattern always matches and so it always ran.
+    fn match_arms<'m>(
+        &self,
+        arms: impl IntoIterator<Item = (&'m syn::Arm, bool)>,
+        at: Recorded,
+        value: bool,
+        on_err: bool,
+    ) -> Paths {
+        let mut out = Paths::default();
+        let mut reached = Some(at);
+        for (arm, handed_back) in arms {
+            let Some(tried) = reached else { break };
+            let start = match &arm.pat {
+                syn::Pat::Guard(g) => {
+                    let p = self.expr(&g.guard, tried, false);
+                    out.exits(p);
+                    reached = if always_matches(&g.pat) || (on_err && any_err(&g.pat)) {
+                        p.falls
+                    } else {
+                        worst(Some(tried), p.falls)
+                    };
+                    let Some(start) = p.falls else { continue };
+                    start
+                }
+                _ => tried,
+            };
+            let p = if handed_back {
+                Paths::falls(Recorded::Yes)
+            } else {
+                self.expr(&arm.body, start, value)
+            };
+            out.exits(p);
+            out.falls = worst(out.falls, p.falls);
+        }
+        out
+    }
+
+    /// A direct handler's error arms.
+    fn arms<'m>(&self, arms: impl IntoIterator<Item = (&'m syn::Arm, bool)>) -> Recorded {
+        let p = self.match_arms(arms, Recorded::No, true, true);
+        worst(p.left, p.falls).unwrap_or(Recorded::Yes)
+    }
+
+    /// The condition or iterator runs first, outside the loop's own `break`.
+    fn maybe_looped(&self, head: &Expr, body: &Block, level: Recorded) -> Paths {
+        let mut out = self.expr(head, level, false);
+        let Some(at) = out.falls else { return out };
+        let b = self.body(body, at);
+        out.left = worst(out.left, b.left);
+        out.falls = worst(Some(at), b.broke);
+        out
+    }
+}
+
 struct Allow {
     line: usize,
     rule: String,
@@ -1036,6 +1677,10 @@ fn parse_allows(src: &str) -> (Vec<Allow>, Vec<(usize, String)>) {
 
 struct Walker<'a> {
     index: &'a Index<'a>,
+    /// The `use` items this fn can see, innermost scope first.
+    imports: &'a [&'a Imports],
+    /// `use` items of the blocks being walked, outermost first.
+    block_imports: Vec<Imports>,
     allows: &'a [Allow],
     owner: Option<&'a str>,
     nodes: Vec<Node>,
@@ -1071,14 +1716,17 @@ impl Walker<'_> {
     }
 
     /// A fork on a `Result` whose arms do nothing fallible handles the error
-    /// in place, so it goes on the railway as a recovery.
+    /// in place, so it goes on the railway as a recovery. Either way, an
+    /// error handler that doesn't record what it stops is a finding.
     fn recover_or_branch(
         &mut self,
         label: String,
         arms: Vec<Arm>,
         scrutinee: &Expr,
         how: Option<(String, Vec<String>)>,
+        (whole, recorded): (proc_macro2::Span, Recorded),
     ) {
+        let handler = how.as_ref().map(|(how, _)| how.clone());
         match how {
             Some((how, patterns)) if arms.iter().all(|a| a.body.is_empty()) => {
                 self.nodes.push(Node::Recover {
@@ -1090,6 +1738,41 @@ impl Walker<'_> {
             }
             _ => self.push_branch(label, arms),
         }
+        let Some(how) = handler else { return };
+        let confidence = match recorded {
+            Recorded::Yes => return,
+            Recorded::Maybe => Confidence::Possible,
+            Recorded::No => Confidence::Certain,
+        };
+        self.nodes.push(Node::Unrecorded {
+            name: step_label(strip_await(scrutinee)).1,
+            how,
+            line: line(scrutinee),
+            confidence,
+            allowed: self.allowed(NO_TRACE, whole.start().line, whole.end().line),
+        });
+    }
+
+    /// How well one error arm records the error it stops, on every path.
+    /// Handing it back to the caller counts as recording.
+    /// The `use` items in scope here, innermost first.
+    fn in_scope(&self) -> Vec<&Imports> {
+        self.block_imports
+            .iter()
+            .rev()
+            .chain(self.imports.iter().copied())
+            .collect()
+    }
+
+    fn arm_records(&self, handed_back: bool, visit: impl FnOnce(&Flow) -> Recorded) -> Recorded {
+        if handed_back {
+            return Recorded::Yes;
+        }
+        let chain = self.in_scope();
+        visit(&Flow {
+            imports: &chain,
+            looping: false,
+        })
     }
 
     /// Visit an expression whose value may be returned: a tail `Err(..)` fails.
@@ -1300,6 +1983,7 @@ impl<'ast> Visit<'ast> for Walker<'_> {
     fn visit_item(&mut self, _: &'ast syn::Item) {} // a nested fn is its own railway
 
     fn visit_block(&mut self, b: &'ast Block) {
+        self.block_imports.push(block_uses(b));
         let n = b.stmts.len();
         for (i, s) in b.stmts.iter().enumerate() {
             match s {
@@ -1310,6 +1994,7 @@ impl<'ast> Visit<'ast> for Walker<'_> {
                 }
             }
         }
+        self.block_imports.pop();
     }
 
     fn visit_local(&mut self, l: &'ast syn::Local) {
@@ -1363,8 +2048,19 @@ impl<'ast> Visit<'ast> for Walker<'_> {
         let label = format!("if {}", canon(&*i.cond));
         match &*i.cond {
             Expr::Let(l) => {
-                let how = result_pat(&l.pat).map(|t| (format!("if let {t}"), vec![canon(&*l.pat)]));
-                self.recover_or_branch(label, arms, &l.expr, how);
+                let tag = result_pat(&l.pat);
+                let how = tag
+                    .as_ref()
+                    .map(|t| (format!("if let {t}"), vec![canon(&*l.pat)]));
+                // The error arm: `then` for `if let Err`, `else` for `if let Ok`.
+                let recorded = match (tag.as_deref(), &i.else_branch) {
+                    (Some("Err"), _) => {
+                        self.arm_records(false, |f| f.handler_block(&i.then_branch))
+                    }
+                    (_, Some((_, other))) => self.arm_records(false, |f| f.handler(other)),
+                    (_, None) => Recorded::No, // `if let Ok(v) = a() { .. }` ignores it
+                };
+                self.recover_or_branch(label, arms, &l.expr, how, (i.span(), recorded));
             }
             _ => self.push_branch(label, arms),
         }
@@ -1418,7 +2114,16 @@ impl<'ast> Visit<'ast> for Walker<'_> {
                 m.arms.iter().map(|a| canon(&a.pat)).collect(),
             )
         });
-        self.recover_or_branch(format!("match {}", canon(&*m.expr)), arms, &m.expr, how);
+        // Every arm that isn't `Ok(..)` can see the error, its guard included.
+        let error_arms = m
+            .arms
+            .iter()
+            .zip(&handed)
+            .filter(|(a, _)| result_pat(&a.pat).as_deref() != Some("Ok"))
+            .map(|(a, h)| (a, returns && *h == Handed::Binding));
+        let recorded = self.arm_records(false, |f| f.arms(error_arms));
+        let label = format!("match {}", canon(&*m.expr));
+        self.recover_or_branch(label, arms, &m.expr, how, (m.span(), recorded));
     }
 
     fn visit_expr_binary(&mut self, b: &'ast syn::ExprBinary) {
@@ -1555,12 +2260,8 @@ impl<'ast> Visit<'ast> for Walker<'_> {
 
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
         self.macro_try += count_try(m.tokens.clone());
-        let name = m
-            .path
-            .segments
-            .last()
-            .map(|s| s.ident.to_string())
-            .unwrap_or_default();
+        // Through any rename: `use std::panic as boom; boom!()`.
+        let name = resolve(&self.in_scope(), &m.path).1;
         if PANIC_MACROS.contains(&name.as_str()) {
             let allowed = self.allowed(NO_PANIC, m.span().start().line, m.span().end().line);
             self.nodes.push(Node::Panic {
@@ -1610,6 +2311,29 @@ pub(crate) fn add_findings(nodes: &[Node], f: &Function, out: &mut Vec<Finding>)
                 NO_SWALLOW,
                 *line,
                 format!("`{how}` drops the error from `{name}`"),
+                *confidence,
+                allowed,
+            )),
+            Node::Unrecorded {
+                name,
+                how,
+                line,
+                confidence,
+                allowed,
+            } => out.push(finding(
+                NO_TRACE,
+                *line,
+                format!(
+                    "`{how}` {} the error from `{name}` without recording it{}",
+                    // `if let Ok(v) = a() { .. }` never looks at the error.
+                    if how == "if let Ok" { "ignores" } else { "handles" },
+                    match confidence {
+                        Confidence::Certain => "",
+                        Confidence::Possible => {
+                            " (it logs with a macro that may be the `log` crate's: import it from `tracing`)"
+                        }
+                    }
+                ),
                 *confidence,
                 allowed,
             )),
@@ -1688,8 +2412,11 @@ impl Report {
                 Returns::Option => Some("None".into()),
                 Returns::Other => None,
             };
+            let chain = collector.imports.chain(&f.path, &f.sig.ident.to_string());
             let mut w = Walker {
                 index: &index,
+                imports: &chain,
+                block_imports: vec![],
                 allows: &allows,
                 owner: f.owner.as_deref(),
                 nodes: vec![],
@@ -2153,6 +2880,7 @@ impl Renderer {
                     self.connect(&open, &id);
                     open = vec![(id, None)];
                 }
+                Node::Unrecorded { .. } => {} // a finding, not a step on the path
                 Node::Recover { name, how, .. } => {
                     let id = self.id("R");
                     self.out +=

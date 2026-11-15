@@ -1,6 +1,6 @@
 // Common wrapper patterns: wrapper closures, `X::Result<T>` aliases,
 // tail `Err(e)` in a match, `?` on Option, and fallible methods in impls.
-#![allow(dead_code)]
+#![allow(dead_code)] #![cfg_attr(rustfmt, rustfmt::skip)] // line numbers are asserted in tests
 
 mod anyhow_like {
     pub type Result<T> = std::result::Result<T, Error>;

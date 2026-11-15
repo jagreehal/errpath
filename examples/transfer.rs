@@ -1,5 +1,5 @@
 // Plain Rust, no special library: the analyzer reads `?` as the railway.
-#![allow(dead_code)]
+#![allow(dead_code)] #![cfg_attr(rustfmt, rustfmt::skip)] // line numbers are asserted in tests
 
 pub struct Input;
 pub struct Rate;

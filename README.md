@@ -153,33 +153,62 @@ Rename `total` to `order_total`, reformat the file or add comments, and `errpath
 
 ## Get started
 
-On your machine, commit your work, then compare your branch with `main`:
+```bash
+cargo install cargo-errpath
+cargo errpath init
+```
+
+`init` writes two files and never overwrites one:
+
+- `.github/workflows/errpath.yml` runs `cargo errpath check` and `cargo test` on every pull request, and posts the review comment.
+- `.claude/settings.json` adds three [Claude Code hooks](#coding-agents). A coding agent then fixes these problems as it works, before you review anything.
+
+When a file already exists, `init` prints what to merge into it.
+
+## One gate: `check`
+
+```bash
+cargo errpath check
+```
+
+`check` runs the tools a Rust project should already use, then errpath:
+
+| Step | Runs | Fails on |
+| --- | --- | --- |
+| `fmt` | `cargo fmt --all --check` | unformatted code |
+| `clippy` | `cargo clippy --workspace --all-targets -- -D warnings` | any warning, including an unused `Result` |
+| `errpath` | `review` against the branch's base, uncommitted edits included | a new `unwrap`, `expect`, panic, dropped error, or error handled without recording it, with no allow comment |
+| `deny` | `cargo deny check`, when cargo-deny and a `deny.toml` are present | advisories, licences, bans |
+| `shear` | `cargo shear`, when cargo-shear is installed | unused dependencies |
+
+Like cargo, `check` uses the workspace of the directory you run it in. It prints one line per step, with each failure's output, and exits 1 if any step failed. A finding errpath is only `possible` about, such as `let _ = tx.send(1)` where it can't see what `send` returns, is listed but doesn't fail the step. Missing optional tools are reported as skipped. The base is `origin/HEAD`, else `main` or `master`. Pass `--base <ref>` to pick another.
+
+errpath fails only on *new* findings, so `check` works on a codebase with years of `unwrap`s from day one. Clippy's `unwrap_used` is all or nothing: deny it and every existing `unwrap` fails the build. Risk ratings aren't a gate either. A moved step is worth a reviewer's look, but it shouldn't block a merge.
+
+Want a review without the other tools? `review` compares your branch, uncommitted edits included, with `main`:
 
 ```bash
 cargo errpath review --base main
 ```
 
-`review` reads both refs from git and ignores uncommitted edits.
+`--head <ref>` reviews a commit instead, and then the work tree is ignored.
 
-On every pull request, add `.github/workflows/errpath.yml`:
+## Coding agents
 
-```yaml
-name: errpath
-on: pull_request
-permissions:
-  contents: read
-  pull-requests: write
-jobs:
-  review:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - uses: jagreehal/errpath@v0.3.0
-```
+An agent runs the compiler until its code builds, so the regressions it ships are the ones that compile. errpath catches the error-path ones: an `unwrap` where a `?` was, or an error dropped to make a type line up.
 
-You get one PR comment that updates as the branch changes, inline annotations on new findings, and a job summary. Low-risk changes skip the comment and appear only in the summary.
+`cargo errpath init` sets up these hooks:
+
+- **When a session starts**, `cargo errpath hook start` records the commit it began from, or the empty tree in a repo with no commits yet. Work the agent commits during the session still counts as its own, even after you exit and resume. The record lives in `.git/errpath/` and is pruned after 30 days untouched.
+- **After every edit** to a `.rs` file, `cargo errpath hook edit` reviews that file's changes since the session began. It needs no build and takes 0.6s on tokio's 555 files. A new finding goes back to the agent, which fixes it in the same turn.
+- **Before the agent finishes**, `cargo errpath hook stop` runs `check` against the session's starting commit. It runs fmt, Clippy, deny and shear in every Cargo workspace the session changed, wherever in the repository the agent is working. A changed shared config, such as a root `.cargo/config.toml` or `rustfmt.toml`, counts as a change to every workspace below it. A change to Rust code, `Cargo.toml`, `Cargo.lock` or the rustfmt, Clippy, cargo-deny, toolchain or Cargo config files triggers it. The agent can't hand back until fmt, Clippy and errpath pass. If its fix still fails, the hook blocks only once and then tells you, so the agent never gets stuck in a loop.
+
+The stop hook always shows you two things, pass or fail:
+
+- **Every new allow comment and its reason.** An agent can silence a finding the same way a person can, so you see each one.
+- **Code errpath couldn't analyse**, such as a file it couldn't read or a new function wrapped in a macro. This doesn't block, because rustc and Clippy still checked that code.
+
+The hooks are a thin layer over `check`, which any agent or editor can run.
 
 ## More shapes
 
@@ -393,11 +422,47 @@ flowchart LR
 | | A step moved into or out of a branch or loop, or a condition changed |
 | | An error conversion changed: `map_err(Top::A)` to `map_err(Top::B)` |
 | | Exits reordered, a return type changed, or `break`/`continue` added or retargeted |
+| | An error handled or ignored without recording it, so it never reaches your traces: `if let Err(e) = send() { retry() }` |
 | | An error handled where it happens added, removed, or changed to catch a different error: `if let Err(e) = send() { log(e) }` |
 | **Low** | A step, failure exit or early return added or removed |
 | | `.context("...")` text or `match` arms changed |
 
 Moved and renamed functions are matched up, so moving code doesn't count as new. Risk points you at the change. The code around it decides whether it matters.
+
+## Errors you can see in your traces
+
+An error handled where it happens leaves no trace unless the handler records it. The service carries on, and nobody learns the email never went. The `no-trace` rule flags a new handler that records nothing:
+
+```rust
+// flagged: the error stops here, and nothing records it
+if let Err(e) = send_confirmation(&receipt) {
+    retry_later(&receipt);
+}
+
+// passes: the error reaches your traces
+if let Err(e) = send_confirmation(&receipt) {
+    tracing::warn!(error = %e, "confirmation email failed");
+    retry_later(&receipt);
+}
+```
+
+Every handler on a `Result` is checked, including one that ends in `return;`, `continue` or a fallback value. Only the arms that see the error count: an `Err(..)` or catch-all arm, or the `else` of `if let Ok`. An `if let Ok` with no `else` ignores the error, and is flagged too. Every path through the handler has to record, so `if fatal { return Err(e); } retry();` is flagged: the path that retries drops the error. errpath follows `if`, `match` arms and guards, `&&` and `||`, loops, and the arguments of standard macros such as `println!` and `assert!`. A path is fine when:
+
+- it hands the error on, with `return Err(..)`, or panics (which `no-panic` reports)
+- it emits a `tracing` event: `tracing::warn!`, `t::warn!` after `use tracing as t`, or a bare `warn!`, `error!`, `info!`, `debug!`, `trace!` or `event!` imported from `tracing`. Imports resolve as rustc does: a fn sees its own `use` items, its blocks' and its module's, and a child module doesn't inherit its parent's
+- it calls a span method that records (`record_error`, `record_exception`, `add_event`, `set_status`, `record`), or anything in [autotel](https://crates.io/crates/autotel)
+
+`log::warn!`, `eprintln!` and `println!` don't count: the first needs a bridge to reach OpenTelemetry, and the others never do. Logging in a closure or async block doesn't count either, because nothing says it runs. A bare macro nothing imports, like `error!` under `#[macro_use] extern crate log`, is reported with `possible` confidence and a hint to import it from `tracing`.
+
+This is a static check. It shows each error reaches a `tracing` event or span. Whether that reaches your backend depends on the service setting up an exporter.
+
+To export `tracing` events over OTLP, add autotel and make this the first line of `main`:
+
+```rust
+let _telemetry = autotel::init(autotel::config!().with_tracing_subscriber())?;
+```
+
+`cargo errpath init` suggests this when no manifest in the repository brings in autotel or the OpenTelemetry SDK.
 
 ## Allowing a finding
 
@@ -454,6 +519,9 @@ Over the last 30 commits of three popular crates, it reported on 39 of 90: 15 lo
 <summary>Commands</summary>
 
 ```bash
+cargo errpath init                                       # CI workflow and agent hooks
+cargo errpath check                                      # fmt, Clippy, errpath, deny, shear
+cargo errpath check --base origin/release                # against another base
 cargo errpath review --base main                         # markdown to stdout
 cargo errpath review --base main --head my-branch        # any two refs
 cargo errpath review --base main crates/billing          # only some paths
@@ -463,7 +531,7 @@ cargo errpath diagram src/checkout.rs place_order        # one function, Mermaid
 cargo errpath ir src                                     # the analysis, as JSON
 ```
 
-`review` reads both refs from git, not your working tree, and starts from their merge base, so work merged to `main` after you branched doesn't count as yours.
+Without `--head`, `review` reads your work tree, uncommitted and untracked files included. With it, both sides come from git. Either way it starts from the merge base, so work merged to `main` after you branched doesn't count as yours.
 
 </details>
 

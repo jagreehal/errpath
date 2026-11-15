@@ -18,9 +18,8 @@ jobs:
           toolchain: stable
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      # `examples/` is left alone: the tests assert line numbers in those fixtures.
-      - run: rustfmt --check --edition 2024 src/lib.rs src/main.rs tests/review_cli.rs
-      - run: cargo clippy --all-targets -- -D warnings
+      # errpath's own gate: rustfmt and Clippy. review.yml covers the PR's error paths.
+      - run: cargo run -q -- errpath check --base HEAD
       - run: cargo test --all-targets
       - uses: actions/setup-python@v7
         with:
