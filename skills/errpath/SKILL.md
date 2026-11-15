@@ -17,7 +17,7 @@ cargo install cargo-errpath
 
 ## Review a change
 
-Commit first: `review` reads refs from git and ignores the working tree.
+`review` compares the work tree, uncommitted edits included, with the base. `--head <ref>` reviews a commit instead.
 
 ```bash
 cargo errpath review --base main                                # markdown
@@ -29,12 +29,23 @@ No stdout means failure paths stayed the same. Read the stderr line too: it says
 
 In JSON, read `risk`, `changed`, `newFindings`, `new_allows`, `functions`, `coverage` and `notes`.
 
+## Before you finish
+
+```bash
+cargo errpath check
+```
+
+Runs `cargo fmt --check`, Clippy with `-D warnings`, errpath, and cargo-deny and cargo-shear when they're installed. Fix every failed step. When `check` passes, the change is formatted, Clippy-clean, and adds no unallowed panics, dropped errors or unrecorded error handlers.
+
+If the project ran `cargo errpath init`, Claude Code hooks already do this: one after each edit, and one before you finish.
+
 ## Act on findings
 
 | Rule | Meaning | Action |
 | --- | --- | --- |
 | `no-panic` | The change added a panic path | Return the error, or allow it with the invariant that holds |
 | `no-swallow` | The change dropped an error | Propagate it with `?`, or handle it with `if let Err(e) = ..` when the caller shouldn't fail. Otherwise allow it with the reason |
+| `no-trace` | The change handles or ignores an error without recording it, so it never reaches traces | Record it in the handler: `tracing::warn!(error = %e, "..")`, or `ctx.record_error(&e)` with autotel. Otherwise allow it with the reason |
 | `bad-allow` | An allow comment has no reason or an unknown rule | Fix the comment |
 
 Treat risk as a prompt to read the surrounding code. High means an error is certainly dropped. Moderate covers new panics, possible drops, moved steps, errors handled in place (`if let Err(e) = a() { log(e) }`), and changed conversions, return types, order or jumps. Low covers added or removed steps and exits, `.context` text and `match` arms.

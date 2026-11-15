@@ -1,5 +1,5 @@
 // Branching railway: forks, early `return Err`, early `return Ok`, rejoin.
-#![allow(dead_code)]
+#![allow(dead_code)] #![cfg_attr(rustfmt, rustfmt::skip)] // line numbers are asserted in tests
 
 pub struct Cart;
 pub struct Receipt;
