@@ -690,3 +690,35 @@ fn a_possible_finding_is_shown_but_does_not_block() {
     assert!(msg.contains("src/lib.rs:2 no-swallow"), "{msg}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn check_before_the_first_commit_skips_build_output() {
+    let dir = repo("check-unborn");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn f() -> u8 {\n    \"1\".parse().unwrap()\n}\n",
+    )
+    .unwrap();
+    // No .gitignore: Cargo's tagged target dir shows up as untracked files.
+    let out_dir = dir.join("target/debug/build/x-1/out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    std::fs::write(
+        dir.join("target/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+    std::fs::write(out_dir.join("version.rs"), "fn v() { x().unwrap(); }\n").unwrap();
+
+    let out = errpath(&dir, &["check"], "");
+    let text = String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
+    assert!(!text.contains("Needed a single revision"), "{text}");
+    assert!(text.contains("src/lib.rs:2 no-panic"), "{text}");
+    assert!(!text.contains("version.rs"), "{text}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -873,10 +873,7 @@ pub fn compare(base: &Report, head: &Report, collapse_diagrams: bool) -> Review 
             ));
         }
     }
-    let (was, now) = (base.coverage.item_macro_try, head.coverage.item_macro_try);
-    if was != now {
-        notes.push(format!("`?` sites inside macros that wrap whole functions went from {was} to {now}. Those functions can't be analysed."));
-    }
+    notes.extend(macro_note(base, head));
 
     // These coming or going decide what else runs, unlike a step doing so.
     // A recovery decides whether an error reaches the caller at all.
@@ -923,7 +920,7 @@ pub fn compare(base: &Report, head: &Report, collapse_diagrams: bool) -> Review 
         "no failure-path change seen"
     };
     review.summary = format!(
-        "{seen} in {} functions; not analysed: {} `?` in macros, {} `?` in macro-wrapped functions, {} unparsed files, {} test/bench/example files",
+        "{seen} in {} functions; not analysed: {} `?` in macros, {} `?` in macro-wrapped items, {} unparsed files, {} test/bench/example files",
         c.functions,
         c.macro_try,
         c.item_macro_try,
@@ -934,6 +931,22 @@ pub fn compare(base: &Report, head: &Report, collapse_diagrams: bool) -> Review 
         review.markdown = fitted_markdown(&review, collapse_diagrams);
     }
     review
+}
+
+/// When the count of `?` inside item-wrapping macros moved, where each one is.
+fn macro_note(base: &Report, head: &Report) -> Option<String> {
+    let (was, now) = (base.coverage.item_macro_try, head.coverage.item_macro_try);
+    if was == now {
+        return None;
+    }
+    let shown = head.unanalysed_try.iter().take(10).map(|s| span(s));
+    let more = (now > 10).then(|| format!("and {} more", now - 10));
+    let at: Vec<_> = shown.chain(more).collect();
+    let at = Some(at.join(", ")).filter(|a| !a.is_empty());
+    let at = at.map_or(String::new(), |a| format!(": {a}"));
+    Some(format!(
+        "`?` sites inside macros that wrap whole items went from {was} to {now}{at}. Those items can't be analysed."
+    ))
 }
 
 /// GitHub refuses a comment over 65,536 characters, which would lose the review
@@ -992,7 +1005,7 @@ fn item_line(i: &Item) -> String {
         ItemKind::Return => "early return".to_string(),
         ItemKind::Jump => span(&i.label),
         ItemKind::Fork => span(&i.label),
-        ItemKind::Diverge => format!("loop that never finishes {}", span(&i.label)),
+        ItemKind::Diverge => format!("{} with no `break`", span(&i.label)),
         ItemKind::Convert => format!("error conversion on {}", span(&i.label)),
         ItemKind::MacroTry => i.label.clone(),
     };
@@ -1320,6 +1333,7 @@ fn report_worktree(top: &Path, paths: &[&str]) -> Result<Report, String> {
         if !path.ends_with(".rs")
             || !file.is_file()
             || file.is_symlink()
+            || in_cache_dir(top, &file)
             || !seen.insert(path.clone())
         {
             continue;
@@ -1329,6 +1343,15 @@ fn report_worktree(top: &Path, paths: &[&str]) -> Result<Report, String> {
         });
     }
     Ok(report.finish())
+}
+
+/// Under a directory tagged with `CACHEDIR.TAG`, as Cargo tags its target
+/// dir: build output, `OUT_DIR` included, that a repo with no `.gitignore` lists.
+fn in_cache_dir(top: &Path, file: &Path) -> bool {
+    file.ancestors()
+        .skip(1)
+        .take_while(|d| d.starts_with(top) && *d != top)
+        .any(|d| d.join("CACHEDIR.TAG").is_file())
 }
 
 fn add(report: &mut Report, path: &str, read: impl FnOnce() -> Result<Vec<u8>, String>) {

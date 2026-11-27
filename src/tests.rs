@@ -2440,3 +2440,673 @@ fn renamed_panic_macros_still_panic() {
     // Unresolved, `boom!` is some other macro.
     assert!(rules("not_a_panic").is_empty());
 }
+
+#[test]
+fn reading_an_error_that_goes_on_to_the_caller_is_not_handling_it() {
+    let r = analyse(
+        "fn returned() -> Result<u8, E> {
+             let result = save();
+             let outcome = match &result { Ok(_) => \"ok\", Err(e) => e.kind() };
+             count(outcome);
+             result
+         }
+         fn in_closure() -> Result<u8, E> {
+             traced(|| { let r = save(); if let Err(e) = &r { note(e); } r })
+         }
+         fn tried() -> Result<u8, E> {
+             let r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             let v = r?;
+             Ok(v)
+         }
+         fn dropped() {
+             let r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+         }",
+    );
+    let flagged: Vec<_> = r
+        .findings
+        .iter()
+        .filter(|f| f.rule == NO_TRACE)
+        .map(|f| f.function.as_deref().unwrap_or(""))
+        .collect();
+    assert_eq!(flagged, ["dropped"], "{:?}", r.findings);
+}
+
+#[test]
+fn a_local_shadowed_in_the_same_body_is_a_different_binding() {
+    let r = analyse(
+        "fn f() -> u8 {
+             let r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             let r = 1;
+             r
+         }
+         fn g() -> Result<(), E> {
+             let r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             let n = 1;
+             r
+         }",
+    );
+    let flagged: Vec<_> = r
+        .findings
+        .iter()
+        .filter(|f| f.rule == NO_TRACE)
+        .map(|f| f.function.as_deref().unwrap_or(""))
+        .collect();
+    assert_eq!(flagged, ["f"], "{:?}", r.findings);
+}
+
+#[test]
+fn struct_paths_resolve_from_the_module_they_are_written_in() {
+    let r = analyse(
+        "pub struct Job { pub run: fn() -> Result<(), Root> }
+         mod a {
+             pub struct Job { pub run: fn() -> Result<(), A> }
+             const HERE: Job = Job { run: || { f()?; Ok(()) } };
+             const UP: super::Job = super::Job { run: || { f()?; Ok(()) } };
+             const SELF: self::Job = self::Job { run: || { f()?; Ok(()) } };
+         }",
+    );
+    let err = |id: &str| match &r.functions.iter().find(|f| f.id == id).unwrap().nodes[0] {
+        Node::Step { error, .. } => error.clone(),
+        other => panic!("{id}: {other:?}"),
+    };
+    assert_eq!(err("a::HERE::run"), Some("A".into()));
+    assert_eq!(err("a::UP::run"), Some("Root".into()));
+    assert_eq!(err("a::SELF::run"), Some("A".into()));
+}
+
+#[test]
+fn macros_and_assignments_are_read_for_handed_on_errors() {
+    let r = analyse(
+        "fn in_macro() -> Result<Vec<u8>, E> {
+             let r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             Ok(vec![r?])
+         }
+         fn maybe_reset(flag: bool) -> Result<u8, E> {
+             let mut r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             if flag { r = Ok(1); }
+             r
+         }
+         fn called() -> Result<u8, E> {
+             let r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             let run = || r;
+             run()
+         }
+         fn stored() -> Result<u8, E> {
+             let r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             let run = || { r?; Ok(1) };
+             drop(run);
+             Ok(1)
+         }
+         fn reset() -> Result<u8, E> {
+             let mut r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             { r = Ok(1); }
+             r
+         }",
+    );
+    let flagged: Vec<_> = r
+        .findings
+        .iter()
+        .filter(|f| f.rule == NO_TRACE)
+        .map(|f| f.function.as_deref().unwrap_or(""))
+        .collect();
+    // A stored closure hands on only when it's called where its value goes on.
+    assert_eq!(flagged, ["stored", "reset"], "{:?}", r.findings);
+}
+
+#[test]
+fn struct_names_follow_use_items_and_globs() {
+    let r = analyse(
+        "mod a { pub struct Job { pub run: fn() -> Result<(), A> } }
+         mod b { pub struct Job { pub run: fn() -> Result<(), B> } }
+         mod c { pub struct Task { pub run: fn() -> Result<(), C> } }
+         mod d { pub struct Task { pub run: fn() -> Result<(), D> } }
+         mod user {
+             use crate::b::Job;
+             use super::d::*;
+             const J: Job = Job { run: || { f()?; Ok(()) } };
+             const T: Task = Task { run: || { f()?; Ok(()) } };
+         }",
+    );
+    let err = |id: &str| match &r.functions.iter().find(|f| f.id == id).unwrap().nodes[0] {
+        Node::Step { error, .. } => error.clone(),
+        other => panic!("{id}: {other:?}"),
+    };
+    assert_eq!(err("user::J::run"), Some("B".into()));
+    assert_eq!(err("user::T::run"), Some("D".into()));
+}
+
+#[test]
+fn struct_names_follow_re_exports() {
+    let mut r = Report::new();
+    r.add_source(
+        "src/lib.rs",
+        "",
+        "mod jobs;
+         mod other { pub struct Job { pub run: fn() -> Result<(), Other> } }
+         pub use jobs::Job as Task;
+         pub use jobs::*;",
+    );
+    r.add_source(
+        "src/jobs.rs",
+        "jobs",
+        "pub struct Job { pub run: fn() -> Result<(), Jobs> }",
+    );
+    r.add_source(
+        "src/user.rs",
+        "user",
+        "const T: crate::Task = crate::Task { run: || { f()?; Ok(()) } };
+         const J: crate::Job = crate::Job { run: || { f()?; Ok(()) } };",
+    );
+    let r = r.finish();
+    let err = |id: &str| match &r.functions.iter().find(|f| f.id == id).unwrap().nodes[0] {
+        Node::Step { error, .. } => error.clone(),
+        other => panic!("{id}: {other:?}"),
+    };
+    assert_eq!(err("user::T::run"), Some("Jobs".into()));
+    assert_eq!(err("user::J::run"), Some("Jobs".into()));
+}
+
+#[test]
+fn errors_go_on_through_locals_and_built_values() {
+    let r = analyse(
+        "fn through_local() -> Result<u8, E> {
+             let r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             let out = traced(|| r);
+             out
+         }
+         fn reassigned(flag: bool) -> Result<u8, E> {
+             let r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             let mut out = Ok(0);
+             if flag { out = r; }
+             out
+         }
+         fn in_struct() -> Job {
+             let r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             Job { run: Box::new(move || r) }
+         }
+         fn returned_closure() -> impl FnOnce() -> Result<u8, E> {
+             let r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             let f = move || r;
+             f
+         }
+         fn statement() -> Result<u8, E> {
+             let r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             traced(|| r);
+             Ok(1)
+         }",
+    );
+    let flagged: Vec<_> = r
+        .findings
+        .iter()
+        .filter(|f| f.rule == NO_TRACE)
+        .map(|f| f.function.as_deref().unwrap_or(""))
+        .collect();
+    // A call made as a statement drops its closure's value.
+    assert_eq!(flagged, ["statement"], "{:?}", r.findings);
+}
+
+#[test]
+fn futures_hand_on_only_when_polled_or_returned() {
+    let r = analyse(
+        "async fn awaited() -> Result<(), E> {
+             let r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             let fut = async move { r?; Ok(()) };
+             fut.await
+         }
+         fn returned() -> impl Future<Output = Result<(), E>> {
+             let r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             async move { r }
+         }
+         fn dropped() -> Result<(), E> {
+             let r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             let _fut = async move { r };
+             Ok(())
+         }",
+    );
+    let flagged: Vec<_> = r
+        .findings
+        .iter()
+        .filter(|f| f.rule == NO_TRACE)
+        .map(|f| f.function.as_deref().unwrap_or(""))
+        .collect();
+    assert_eq!(flagged, ["dropped"], "{:?}", r.findings);
+}
+
+#[test]
+fn generic_field_errors_take_the_item_types_arguments() {
+    let r = analyse(
+        "struct Job<'a, E> { run: fn(&'a str) -> Result<(), Box<E>> }
+         const JOBS: [Job<'static, Io>; 1] = [Job { run: |_| { save()?; Ok(()) } }];",
+    );
+    let job = r.functions.iter().find(|f| f.id == "JOBS::run").unwrap();
+    assert_eq!(
+        job.returns,
+        Returns::Result {
+            error: "Box<Io>".into()
+        }
+    );
+    let params = ["E".to_string(), "T".to_string()];
+    let sub = |error: &str| match substitute(
+        Returns::Result {
+            error: error.into(),
+        },
+        &params,
+        &["A".into()],
+    ) {
+        Returns::Result { error } => error,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(sub("Wrap<E, Ex>"), "Wrap<A, Ex>");
+    assert_eq!(
+        sub("Wrap<errors::E, E::Error, T>"),
+        "Wrap<errors::E, A::Error, T>"
+    );
+    assert_eq!(sub("not a type <"), "not a type <");
+}
+
+#[test]
+fn drop_discards_a_closure_even_in_a_returned_one() {
+    let r = analyse(
+        "fn f() -> Result<(), E> {
+             let r = save();
+             match &r { Ok(_) => {}, Err(_) => {} }
+             traced(|| { drop(move || r); Ok(()) })
+         }",
+    );
+    assert!(
+        r.findings.iter().any(|f| f.rule == NO_TRACE),
+        "{:?}",
+        r.findings
+    );
+}
+
+#[test]
+fn closures_in_const_and_static_items_are_walked() {
+    let r = analyse(
+        "pub struct S { pub build: fn(u8) -> Result<u8, String> }
+pub const ALL: [S; 2] = [
+    S { build: |x| { let y = f(x)?; Ok(vec![g(y)?][0]) } },
+    S { build: |x| Ok(h(x)?) },
+];
+static ONE: fn(u8) -> Result<u8, String> = |x| Ok(f(x).unwrap());
+static LAZY: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| h(1).unwrap());
+const PLAIN: u8 = 1;
+impl S { const NEW: fn(u8) -> Option<u8> = |x| Some(h(x)?); }
+fn f(x: u8) -> Result<u8, String> { Ok(x) }",
+    );
+    let ids: Vec<_> = r.functions.iter().map(|f| f.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["f", "ALL::build", "ALL::build#2", "ONE", "LAZY", "S::NEW"]
+    );
+    let by_id = |id: &str| r.functions.iter().find(|f| f.id == id).unwrap();
+    // Each closure is its own function, not a box inside the item.
+    let first = by_id("ALL::build");
+    assert_eq!(
+        (first.name.as_str(), first.line, first.macro_try),
+        ("build", 3, 1)
+    );
+    let step = |id: &str| match &by_id(id).nodes[0] {
+        Node::Step {
+            name,
+            error,
+            source,
+            ..
+        } => (name.clone(), error.clone(), *source),
+        other => panic!("{id}: {other:?}"),
+    };
+    // The field's type says what `?` on an unknown callee converts into.
+    assert_eq!(
+        step("ALL::build"),
+        ("f".into(), Some("String".into()), ErrorSource::Callee)
+    );
+    assert_eq!(
+        step("ALL::build#2"),
+        ("h".into(), Some("String".into()), ErrorSource::Enclosing)
+    );
+    assert_eq!(
+        step("S::NEW"),
+        ("h".into(), Some("None".into()), ErrorSource::Enclosing)
+    );
+    assert_eq!(by_id("LAZY").returns, Returns::Other);
+    let panics: Vec<_> = r
+        .findings
+        .iter()
+        .filter(|f| f.rule == NO_PANIC)
+        .filter_map(|f| f.function.as_deref())
+        .collect();
+    assert_eq!(panics, ["ONE", "LAZY"]);
+    assert_eq!(r.coverage.item_macro_try, 0);
+}
+
+#[test]
+fn closure_return_types_come_from_wrappers_explicit_types_and_other_files() {
+    let mut r = Report::new();
+    r.add_source(
+        "src/lib.rs",
+        "",
+        "mod table;
+         pub struct Job { pub run: Box<dyn Fn() -> Option<u8> + Sync>, pub label: &'static str }
+         pub struct Other;
+         impl Other { fn run(&self) -> Result<u8, Bad> { Ok(1) } }
+         fn caller(o: Other) -> Result<u8, Bad> { o.run()?; Ok(1) }",
+    );
+    r.add_source(
+        "src/table.rs",
+        "table",
+        "pub const JOBS: &[Job] = &[Job { run: Box::new(|| Some(n()?)), label: \"a\" }];
+         pub fn wrapped() -> u8 { traced(|| -> Result<u8, Io> { Ok(n()?) }); 1 }",
+    );
+    let r = r.finish();
+    fn first(nodes: &[Node]) -> Option<&Node> {
+        match nodes.first()? {
+            Node::Scope { body, .. } => first(body),
+            n => Some(n),
+        }
+    }
+    let err_of = |id: &str| {
+        let f = r.functions.iter().find(|f| f.id == id).unwrap();
+        match first(&f.nodes) {
+            Some(Node::Step { error, .. }) => error.clone(),
+            other => panic!("{id}: {other:?}"),
+        }
+    };
+    // Through `Box::new` and `Box<dyn Fn() -> R>`, from a struct in another file.
+    assert_eq!(err_of("table::JOBS::run"), Some("None".into()));
+    // An explicit `-> T` on a closure inside a fn names its error.
+    assert_eq!(err_of("table::wrapped"), Some("Io".into()));
+    // A field named like a method doesn't make the method ambiguous.
+    assert_eq!(err_of("caller"), Some("Bad".into()));
+}
+
+#[test]
+fn review_regression_const_initializer_keeps_nested_functions() {
+    let r = analyse(
+        "const CALLBACK: fn() = {
+             fn callback() { panic!(\"failure\"); }
+             callback
+         };",
+    );
+    assert!(
+        r.findings.iter().any(|f| f.rule == NO_PANIC),
+        "{:?}",
+        r.functions
+    );
+}
+
+#[test]
+fn review_regression_macro_in_const_initializer_counts_unanalysed_try() {
+    let r = analyse("const CALLBACK: fn() -> Result<(), E> = wrap!(|| { save()?; Ok(()) });");
+    assert_eq!(r.coverage.item_macro_try, 1);
+    assert_eq!(r.unanalysed_try, ["test.rs:1"]);
+}
+
+#[test]
+fn review_regression_borrowed_error_returned_through_branch_is_not_handled() {
+    let r = analyse(
+        "fn f(flag: bool) -> Result<(), E> {
+             let r = save();
+             if let Err(e) = &r { inspect(e); }
+             if flag { r } else { r }
+         }",
+    );
+    assert!(
+        !r.findings.iter().any(|f| f.rule == NO_TRACE),
+        "{:?}",
+        r.findings
+    );
+}
+
+#[test]
+fn review_regression_const_block_preserves_callable_return_type() {
+    let r = analyse(
+        "const CALLBACK: fn() -> Result<(), E> = {
+             || { save()?; Ok(()) }
+         };",
+    );
+    assert_eq!(
+        r.functions[0].returns,
+        Returns::Result { error: "E".into() }
+    );
+}
+
+#[test]
+fn review_regression_qualified_struct_fields_keep_their_return_types() {
+    let r = analyse(
+        "mod a { pub struct Job { pub run: fn() -> Option<()> } }
+         mod b { pub struct Job { pub run: fn() -> Result<(), E> } }
+         const A: a::Job = a::Job { run: || Some(load()?) };
+         const B: b::Job = b::Job { run: || { save()?; Ok(()) } };",
+    );
+    let a = r.functions.iter().find(|f| f.id == "A::run").unwrap();
+    let b = r.functions.iter().find(|f| f.id == "B::run").unwrap();
+    assert_eq!(a.returns, Returns::Option);
+    assert_eq!(b.returns, Returns::Result { error: "E".into() });
+}
+
+#[test]
+fn review_regression_unrelated_closure_local_does_not_hide_error_handling() {
+    let r = analyse(
+        "fn f() {
+             let r = save();
+             if let Err(e) = &r { inspect(e); }
+             let callback = || { let r = 1; r };
+             callback();
+         }",
+    );
+    assert!(
+        r.findings.iter().any(|f| f.rule == NO_TRACE),
+        "{:?}",
+        r.findings
+    );
+}
+
+#[test]
+fn review_regression_shadowed_block_local_does_not_hide_error_handling() {
+    let r = analyse(
+        "fn f() -> Result<(), E> {
+             let r = save();
+             if let Err(e) = &r { inspect(e); }
+             { let r: Result<(), E> = Ok(()); r?; }
+             Ok(())
+         }",
+    );
+    assert!(
+        r.findings.iter().any(|f| f.rule == NO_TRACE),
+        "{:?}",
+        r.findings
+    );
+}
+
+#[test]
+fn review_regression_closure_borrows_error_returned_by_outer_function() {
+    let r = analyse(
+        "fn f() -> Result<(), E> {
+             let r = save();
+             traced(|| { if let Err(e) = &r { inspect(e); } });
+             r
+         }",
+    );
+    assert!(
+        !r.findings.iter().any(|f| f.rule == NO_TRACE),
+        "{:?}",
+        r.findings
+    );
+}
+
+#[test]
+fn review_regression_crate_qualified_struct_excludes_nested_namesakes() {
+    let r = analyse(
+        "pub struct Job { pub run: fn() -> Result<(), E> }
+         mod nested { pub struct Job { pub run: fn() -> Option<()> } }
+         const JOB: crate::Job = crate::Job { run: || { save()?; Ok(()) } };",
+    );
+    let job = r.functions.iter().find(|f| f.id == "JOB::run").unwrap();
+    assert_eq!(job.returns, Returns::Result { error: "E".into() });
+}
+
+#[test]
+fn review_regression_overwriting_result_does_not_count_as_propagation() {
+    let r = analyse(
+        "fn f() -> Result<(), E> {
+             let mut r = save();
+             if let Err(e) = &r { inspect(e); }
+             r = Ok(());
+             r
+         }",
+    );
+    assert!(
+        r.findings.iter().any(|f| f.rule == NO_TRACE),
+        "{:?}",
+        r.findings
+    );
+}
+
+#[test]
+fn review_regression_dropped_closure_does_not_propagate_captured_result() {
+    let r = analyse(
+        "fn f() {
+             let r = save();
+             if let Err(e) = &r { inspect(e); }
+             let callback = || r;
+             drop(callback);
+         }",
+    );
+    assert!(
+        r.findings.iter().any(|f| f.rule == NO_TRACE),
+        "{:?}",
+        r.findings
+    );
+}
+
+#[test]
+fn review_regression_unconditional_nested_assignment_replaces_result() {
+    let r = analyse(
+        "fn f() -> Result<(), E> {
+             let mut r = save();
+             if let Err(e) = &r { inspect(e); }
+             { r = Ok(()); }
+             r
+         }",
+    );
+    assert!(
+        r.findings.iter().any(|f| f.rule == NO_TRACE),
+        "{:?}",
+        r.findings
+    );
+}
+
+#[test]
+fn review_regression_dropped_closure_explicit_return_and_try_do_not_propagate() {
+    let mut missed = vec![];
+    for body in ["return r;", "r?; Ok(())"] {
+        let r = analyse(&format!(
+            "fn f() {{
+                 let r = save();
+                 if let Err(e) = &r {{ inspect(e); }}
+                 let callback = || -> Result<(), E> {{ {body} }};
+                 drop(callback);
+             }}",
+        ));
+        if !r.findings.iter().any(|f| f.rule == NO_TRACE) {
+            missed.push(body);
+        }
+    }
+    assert!(missed.is_empty(), "missing no-trace for {missed:?}");
+}
+
+#[test]
+fn review_regression_trait_default_const_closure_is_analysed() {
+    let r = analyse(
+        "trait Callbacks {
+             const CALLBACK: fn() = || { panic!(\"failure\"); };
+         }",
+    );
+    assert!(
+        r.findings.iter().any(|f| f.rule == NO_PANIC),
+        "{:?}",
+        r.functions
+    );
+}
+
+#[test]
+fn review_regression_unpolled_async_block_does_not_propagate_captured_error() {
+    let r = analyse(
+        "fn f() {
+             let r = save();
+             if let Err(e) = &r { inspect(e); }
+             let future = async move { r?; Ok::<(), E>(()) };
+             drop(future);
+         }",
+    );
+    assert!(
+        r.findings.iter().any(|f| f.rule == NO_TRACE),
+        "{:?}",
+        r.findings
+    );
+}
+
+#[test]
+fn review_regression_drop_does_not_run_its_closure_argument() {
+    let r = analyse(
+        "fn f() {
+             let r = save();
+             if let Err(e) = &r { inspect(e); }
+             std::mem::drop(move || r)
+         }",
+    );
+    assert!(
+        r.findings.iter().any(|f| f.rule == NO_TRACE),
+        "{:?}",
+        r.findings
+    );
+}
+
+#[test]
+fn review_regression_generic_callback_field_uses_concrete_error_type() {
+    let r = analyse(
+        "struct Job<E> { run: fn() -> Result<(), E> }
+         const JOB: Job<String> = Job::<String> { run: || { save()?; Ok(()) } };",
+    );
+    let job = r.functions.iter().find(|f| f.id == "JOB::run").unwrap();
+    assert_eq!(
+        job.returns,
+        Returns::Result {
+            error: "String".into()
+        }
+    );
+}
+
+#[test]
+fn review_regression_generic_substitution_preserves_qualified_type_names() {
+    let r = analyse(
+        "mod errors { pub struct E; }
+         struct Job<E> { run: fn() -> Result<E, errors::E> }
+         const JOB: Job<u8> = Job::<u8> { run: || { save()?; Ok(1) } };
+         fn save() -> Result<(), errors::E> { Ok(()) }",
+    );
+    let job = r.functions.iter().find(|f| f.id == "JOB::run").unwrap();
+    assert_eq!(
+        job.returns,
+        Returns::Result {
+            error: "errors::E".into()
+        }
+    );
+}
