@@ -1,0 +1,36 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "cargo errpath hook start", "timeout": 10 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo errpath hook edit",
+            "timeout": 30,
+            "statusMessage": "errpath: checking the edited file"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo errpath hook stop",
+            "timeout": 300,
+            "statusMessage": "errpath: rustfmt, Clippy and error paths"
+          }
+        ]
+      }
+    ]
+  }
+}

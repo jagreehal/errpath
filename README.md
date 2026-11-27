@@ -210,6 +210,10 @@ The stop hook always shows you two things, pass or fail:
 
 The hooks are a thin layer over `check`, which any agent or editor can run.
 
+### Measuring whether Result types + errpath help
+
+[`agent-eval/`](agent-eval/) compares **panic-style** vs **typed Result** checkouts, with and without an errpath finish gate. Live Claude runs on the small fixture hit a ceiling (all cells passed); the grader still fails known swallow/panic regressions. Write-up: [`docs/agents-pass-the-compiler.md`](docs/agents-pass-the-compiler.md).
+
 ## More shapes
 
 Every diagram below is unedited `cargo errpath diagram` output.
@@ -360,7 +364,7 @@ flowchart LR
 
 ### Closures and async blocks
 
-The closure passed to `traced` is drawn as its own box, inside the function that calls it.
+The closure passed to `traced` is drawn as its own box, inside the function that calls it. A closure stored in a `const` or `static`, such as a table of `build: |x| ..` entries, gets a function of its own, named by the field it fills (`SCENARIOS::build`).
 
 ```rust
 async fn sync_account(id: AccountId) -> Result<(), SyncError> {
@@ -452,7 +456,7 @@ Every handler on a `Result` is checked, including one that ends in `return;`, `c
 - it emits a `tracing` event: `tracing::warn!`, `t::warn!` after `use tracing as t`, or a bare `warn!`, `error!`, `info!`, `debug!`, `trace!` or `event!` imported from `tracing`. Imports resolve as rustc does: a fn sees its own `use` items, its blocks' and its module's, and a child module doesn't inherit its parent's
 - it calls a span method that records (`record_error`, `record_exception`, `add_event`, `set_status`, `record`), or anything in [autotel](https://crates.io/crates/autotel)
 
-`log::warn!`, `eprintln!` and `println!` don't count: the first needs a bridge to reach OpenTelemetry, and the others never do. Logging in a closure or async block doesn't count either, because nothing says it runs. A bare macro nothing imports, like `error!` under `#[macro_use] extern crate log`, is reported with `possible` confidence and a hint to import it from `tracing`.
+`log::warn!`, `eprintln!` and `println!` don't count: the first needs a bridge to reach OpenTelemetry, and the others never do. Logging in a closure or async block doesn't count either, because nothing says it runs. Reading an error doesn't handle it, so `match &r { Err(e) => .., _ => {} }` passes when `r` itself goes on to the caller: through `?`, `return`, the function's value, a local, or a closure that runs. A bare macro nothing imports, like `error!` under `#[macro_use] extern crate log`, is reported with `possible` confidence and a hint to import it from `tracing`.
 
 This is a static check. It shows each error reaches a `tracing` event or span. Whether that reaches your backend depends on the service setting up an exporter.
 
@@ -482,7 +486,7 @@ The reason is required, and every new allow still appears in the review, so noth
 <details>
 <summary>What syntax alone can't see</summary>
 
-- **Macros.** A `?` inside a macro call is counted but not placed. Functions wrapped entirely in a macro, like `cfg_rt! { .. }`, aren't analysed.
+- **Macros.** A `?` inside a macro call is counted but not placed. Functions wrapped entirely in a macro, like `cfg_rt! { .. }`, aren't analysed, and the review lists the file and line of each `?` inside them.
 - **Types.** `errpath` names each error from the called function's signature, matched by name across the crate. A binary and its package's library count as separate crates, as `rustc` builds them. On real crates about half of steps get a named error. The rest show the enclosing function's error, or "unknown error". Names are matched without `use` paths, so a crate fn can claim a call to a dependency's fn of the same name. A method call like `x.load()` matches within its own file, since syntax can't tell the type of `x`.
 - **Implicit conversions.** A change inside `impl From<A> for B` doesn't appear at the `?` that uses it.
 - **Data flow.** A loop with nothing fallible can set a variable that a later `if` fails on. The two aren't connected.

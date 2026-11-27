@@ -1,1 +1,5 @@
 /target
+agent-eval/fixture/target
+agent-eval/fixtures/*/target
+__pycache__/
+.DS_Store

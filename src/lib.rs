@@ -186,6 +186,7 @@ pub struct Coverage {
     /// `?` inside macro calls in fn bodies: not drawn.
     pub macro_try: usize,
     /// `?` inside macros that wrap items, so their fns aren't analysed at all.
+    /// Located in `Report::unanalysed_try`.
     pub item_macro_try: usize,
 }
 
@@ -204,6 +205,8 @@ pub struct Report {
     pub parse_failures: Vec<ParseFailure>,
     /// Files under a package's `tests/`, `benches/` or `examples/`.
     pub support_files_skipped: usize,
+    /// `file:line` of each `?` counted in `coverage.item_macro_try`.
+    pub unanalysed_try: Vec<String>,
     #[serde(skip)]
     test_files: HashSet<String>,
     /// (file, module, source), walked in `finish` once every signature is known.
@@ -251,6 +254,280 @@ struct RawFn<'ast> {
     block: Option<&'ast Block>,
 }
 
+struct RawConst<'ast> {
+    path: Vec<String>,
+    owner: Option<String>,
+    ident: &'ast syn::Ident,
+    ty: &'ast Type,
+    expr: &'ast Expr,
+}
+
+/// A struct field that holds a fn pointer or closure, and what that returns.
+struct RawField {
+    path: Vec<String>,
+    owner: String,
+    name: String,
+    returns: Returns,
+    /// The struct's type parameters, which `returns` may name.
+    params: Vec<String>,
+}
+
+/// The outermost closures in an expression; ones inside them are theirs.
+#[derive(Default)]
+struct Closures<'ast>(Vec<&'ast syn::ExprClosure>);
+
+impl<'ast> Visit<'ast> for Closures<'ast> {
+    fn visit_item(&mut self, _: &'ast syn::Item) {}
+
+    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
+        self.0.push(c);
+    }
+}
+
+/// A closure stored in a `const` or `static`.
+struct ConstClosure<'ast> {
+    closure: &'ast syn::ExprClosure,
+    /// The struct field it fills, if any.
+    label: Option<String>,
+    returns: Option<Returns>,
+}
+
+/// The closures in a `const` initialiser, with what each returns when a type
+/// says: its own `-> T`, else the field it fills, else the item's type.
+/// `label` names the field `e` fills, empty for none.
+fn const_closures<'ast>(
+    index: &Index,
+    site: &Site,
+    e: &'ast Expr,
+    label: &str,
+    expect: Option<Returns>,
+    out: &mut Vec<ConstClosure<'ast>>,
+) {
+    let start = out.len();
+    match e {
+        Expr::Closure(c) => out.push(ConstClosure {
+            closure: c,
+            label: None,
+            returns: closure_returns(c).or(expect),
+        }),
+        Expr::Array(a) => a
+            .elems
+            .iter()
+            .for_each(|x| const_closures(index, site, x, "", expect.clone(), out)),
+        Expr::Reference(r) => const_closures(index, site, &r.expr, "", expect, out),
+        Expr::Paren(p) => const_closures(index, site, &p.expr, "", expect, out),
+        Expr::Struct(s) => struct_closures(index, site, s, out),
+        // `{ ..; || .. }`: the block's value is what the type describes.
+        Expr::Block(b) => match b.block.stmts.split_last() {
+            Some((Stmt::Expr(tail, None), rest)) => {
+                rest.iter().for_each(|s| untyped(|f| f.visit_stmt(s), out));
+                const_closures(index, site, tail, "", expect, out);
+            }
+            _ => untyped(|f| f.visit_block(&b.block), out),
+        },
+        // `Box::new(|| ..)` for a `Box<dyn Fn() -> R>` field: the type reads through.
+        Expr::Call(c) if is_wrapper_new(c) => c
+            .args
+            .iter()
+            .for_each(|x| const_closures(index, site, x, "", expect.clone(), out)),
+        other => untyped(|f| f.visit_expr(other), out),
+    }
+    // The innermost field names a closure: `a: S { b: || .. }` is `b`.
+    if !label.is_empty() {
+        for c in &mut out[start..] {
+            c.label.get_or_insert_with(|| label.to_string());
+        }
+    }
+}
+
+/// Closures no type describes, typed only by their own `-> T`.
+fn untyped<'ast>(find: impl FnOnce(&mut Closures<'ast>), out: &mut Vec<ConstClosure<'ast>>) {
+    let mut found = Closures::default();
+    find(&mut found);
+    out.extend(found.0.into_iter().map(|c| ConstClosure {
+        closure: c,
+        label: None,
+        returns: closure_returns(c),
+    }));
+}
+
+/// Each field of a struct literal, expecting what the field's type returns.
+fn struct_closures<'ast>(
+    index: &Index,
+    site: &Site,
+    s: &'ast syn::ExprStruct,
+    out: &mut Vec<ConstClosure<'ast>>,
+) {
+    let path: Vec<_> = s
+        .path
+        .segments
+        .iter()
+        .map(|seg| seg.ident.to_string())
+        .collect();
+    // `Job::<String> { .. }`, else the item's type when it names this struct.
+    let mut args = s.path.segments.last().map(type_args).unwrap_or_default();
+    if args.is_empty()
+        && let Some(owner) = path.last()
+    {
+        args = struct_type_args(site.item_ty, owner);
+    }
+    for f in &s.fields {
+        let name = match &f.member {
+            syn::Member::Named(n) => n.to_string(),
+            syn::Member::Unnamed(i) => i.index.to_string(),
+        };
+        let expect = index.field(&path, &name, site, &args);
+        const_closures(index, site, &f.expr, &name, expect, out);
+    }
+}
+
+/// `Box::new(x)`, `Arc::new(x)`, `Rc::new(x)`: the wrapped value is the closure.
+fn is_wrapper_new(c: &syn::ExprCall) -> bool {
+    let Expr::Path(p) = &*c.func else {
+        return false;
+    };
+    let names: Vec<_> = p
+        .path
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect();
+    c.args.len() == 1
+        && matches!(&names[..], [.., w, new] if new == "new" && ["Box", "Arc", "Rc"].contains(&w.as_str()))
+}
+
+fn closure_returns(c: &syn::ExprClosure) -> Option<Returns> {
+    match &c.output {
+        ReturnType::Default => None,
+        out => Some(returns(out)),
+    }
+}
+
+/// What `?` converts into in a body returning this.
+fn default_err(r: &Returns) -> Option<String> {
+    match r {
+        Returns::Result { error } => Some(error.clone()),
+        Returns::Option => Some("None".into()),
+        Returns::Other => None,
+    }
+}
+
+/// What a fn pointer or `Fn` trait type returns, through arrays, references
+/// and wrappers such as `Box<dyn Fn() -> R>`.
+// A wrapper is read through its first type argument.
+fn callable_returns(ty: &Type) -> Option<Returns> {
+    match ty {
+        Type::FnPtr(f) => Some(returns(&f.output)),
+        Type::Array(a) => callable_returns(&a.elem),
+        Type::Slice(s) => callable_returns(&s.elem),
+        Type::Reference(r) => callable_returns(&r.elem),
+        Type::Paren(p) => callable_returns(&p.elem),
+        Type::Group(g) => callable_returns(&g.elem),
+        Type::TraitObject(t) => fn_bound(&t.bounds),
+        Type::ImplTrait(t) => fn_bound(&t.bounds),
+        Type::Path(p) => first_type_arg(p).and_then(callable_returns),
+        _ => None,
+    }
+}
+
+/// `Fn(..) -> R`, `FnMut` or `FnOnce` among a type's bounds.
+fn fn_bound(bounds: &Punctuated<syn::TypeParamBound, Token![+]>) -> Option<Returns> {
+    bounds.iter().find_map(|b| {
+        let syn::TypeParamBound::Trait(t) = b else {
+            return None;
+        };
+        let seg = t.path.segments.last()?;
+        let syn::PathArguments::Parenthesized(args) = &seg.arguments else {
+            return None;
+        };
+        ["Fn", "FnMut", "FnOnce"]
+            .iter()
+            .any(|f| seg.ident == f)
+            .then(|| returns(&args.output))
+    })
+}
+
+/// The type arguments of a path segment, as text: `String` in `Job<String>`.
+fn type_args(seg: &syn::PathSegment) -> Vec<String> {
+    let syn::PathArguments::AngleBracketed(a) = &seg.arguments else {
+        return vec![];
+    };
+    (a.args.iter())
+        .filter_map(|g| match g {
+            syn::GenericArgument::Type(t) => Some(text(t)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The type arguments `ty` gives struct `owner`, through arrays and references.
+fn struct_type_args(ty: &Type, owner: &str) -> Vec<String> {
+    match ty {
+        Type::Path(p) => match p.path.segments.last() {
+            Some(seg) if seg.ident == owner => type_args(seg),
+            _ => vec![],
+        },
+        Type::Array(a) => struct_type_args(&a.elem, owner),
+        Type::Slice(s) => struct_type_args(&s.elem, owner),
+        Type::Reference(r) => struct_type_args(&r.elem, owner),
+        Type::Paren(p) => struct_type_args(&p.elem, owner),
+        _ => vec![],
+    }
+}
+
+/// `returns` with each type parameter in its error replaced by its argument:
+/// `E` and `E::Assoc` are the parameter, `errors::E` isn't.
+fn substitute(returns: Returns, params: &[String], args: &[String]) -> Returns {
+    let Returns::Result { error } = returns else {
+        return returns;
+    };
+    let Ok(ty) = syn::parse_str::<Type>(&error) else {
+        return Returns::Result { error };
+    };
+    let mut uses = ParamUses { params, at: vec![] };
+    uses.visit_type(&ty);
+    let mut chars: Vec<char> = error.chars().collect();
+    // Back to front, so earlier columns stay put.
+    uses.at.sort_unstable_by(|a, b| b.cmp(a));
+    for (column, i) in uses.at {
+        if let Some(arg) = args.get(i) {
+            chars.splice(column..column + params[i].chars().count(), arg.chars());
+        }
+    }
+    Returns::Result {
+        error: chars.into_iter().collect(),
+    }
+}
+
+/// Where a type names one of `params`: (column, which).
+struct ParamUses<'p> {
+    params: &'p [String],
+    at: Vec<(usize, usize)>,
+}
+
+impl<'ast> Visit<'ast> for ParamUses<'_> {
+    fn visit_type_path(&mut self, t: &'ast syn::TypePath) {
+        if t.qself.is_none()
+            && t.path.leading_colon.is_none()
+            && let Some(first) = t.path.segments.first()
+            && let Some(i) = self.params.iter().position(|p| first.ident == p)
+        {
+            self.at.push((first.ident.span().start().column, i));
+        }
+        visit::visit_type_path(self, t);
+    }
+}
+
+fn first_type_arg(p: &syn::TypePath) -> Option<&Type> {
+    let syn::PathArguments::AngleBracketed(a) = &p.path.segments.last()?.arguments else {
+        return None;
+    };
+    a.args.iter().find_map(|g| match g {
+        syn::GenericArgument::Type(t) => Some(t),
+        _ => None,
+    })
+}
+
 /// Finds every fn: free, impl, trait methods with or without a body, in inline
 /// mods and nested in other fns. Test code is skipped.
 #[derive(Default)]
@@ -262,8 +539,12 @@ struct Collector<'ast> {
     test_mods: Vec<String>,
     /// Top-level `mod x;`: files that join this one's crate.
     mods: Vec<String>,
-    /// `?` in macros outside any fn, e.g. `ffi_fn! { fn f() { a()?; } }`.
-    item_macro_try: usize,
+    /// Lines of `?` in macros outside any fn, e.g. `ffi_fn! { fn f() { a()?; } }`.
+    item_macro_try: Vec<usize>,
+    /// `const` and `static` items that hold closures.
+    consts: Vec<RawConst<'ast>>,
+    /// Struct fields that hold closures, so a closure stored in one knows its return type.
+    fields: Vec<RawField>,
     fn_depth: usize,
     /// `use` items by the scope they sit in, to tell `tracing::warn!` from `log::warn!`.
     imports: Scopes,
@@ -290,6 +571,24 @@ impl<'ast> Collector<'ast> {
         self.fn_depth -= 1;
         self.owner = owner;
         self.path.pop();
+    }
+
+    /// A `const` or `static` holding a closure, walked like a fn whose body is
+    /// its initialiser. Without one it's evaluated at compile time, and can't
+    /// hold a `?`. Still descended into for nested items and macros.
+    fn add_const(&mut self, ident: &'ast syn::Ident, ty: &'ast Type, expr: &'ast Expr) {
+        let mut found = Closures::default();
+        found.visit_expr(expr);
+        if !found.0.is_empty() {
+            self.consts.push(RawConst {
+                path: self.path.clone(),
+                owner: self.owner.clone(),
+                ident,
+                ty,
+                expr,
+            });
+        }
+        self.visit_expr(expr);
     }
 
     fn within(&mut self, segment: String, owner: Option<String>, f: impl FnOnce(&mut Self)) {
@@ -334,6 +633,14 @@ impl<'ast> Visit<'ast> for Collector<'ast> {
         self.add(&f.sig, f.default.as_ref());
     }
 
+    fn visit_trait_item_const(&mut self, c: &'ast syn::TraitItemConst) {
+        if let Some((_, expr)) = &c.default
+            && !is_test(&c.attrs)
+        {
+            self.add_const(&c.ident, &c.ty, expr);
+        }
+    }
+
     fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
         if !is_test(&m.attrs) {
             // `mod_files` maps top-level `mod x;` declarations to files.
@@ -356,9 +663,56 @@ impl<'ast> Visit<'ast> for Collector<'ast> {
         }
     }
 
+    /// A closure body is walked (in a fn, or as a const's own function), so its
+    /// macros aren't unanalysed `?` sites.
+    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
+        self.fn_depth += 1;
+        visit::visit_expr_closure(self, c);
+        self.fn_depth -= 1;
+    }
+
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
         if self.fn_depth == 0 {
-            self.item_macro_try += count_try(m.tokens.clone());
+            self.item_macro_try.extend(try_lines(m.tokens.clone()));
+        }
+    }
+
+    fn visit_item_const(&mut self, c: &'ast syn::ItemConst) {
+        if !is_test(&c.attrs) {
+            self.add_const(&c.ident, &c.ty, &c.expr);
+        }
+    }
+
+    fn visit_item_struct(&mut self, s: &'ast syn::ItemStruct) {
+        if is_test(&s.attrs) {
+            return;
+        }
+        for f in &s.fields {
+            if let (Some(name), Some(returns)) = (&f.ident, callable_returns(&f.ty)) {
+                self.fields.push(RawField {
+                    path: self.path.clone(),
+                    owner: s.ident.to_string(),
+                    name: name.to_string(),
+                    returns,
+                    params: s
+                        .generics
+                        .type_params()
+                        .map(|p| p.ident.to_string())
+                        .collect(),
+                });
+            }
+        }
+    }
+
+    fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {
+        if !is_test(&s.attrs) {
+            self.add_const(&s.ident, &s.ty, &s.expr);
+        }
+    }
+
+    fn visit_impl_item_const(&mut self, c: &'ast syn::ImplItemConst) {
+        if !is_test(&c.attrs) {
+            self.add_const(&c.ident, &c.ty, &c.expr);
         }
     }
 
@@ -435,12 +789,114 @@ struct Callee {
     method: bool,
 }
 
+#[derive(Clone)]
 struct IndexEntry {
     owner: Option<String>,
     name: String,
     returns: Returns,
     /// Module path of the file plus any inline `mod`s, e.g. `app::db`.
     module: String,
+    /// A struct field holding a fn pointer or closure, not a fn: `(s.build)(x)`
+    /// isn't a method call, so only `Index::field` finds it.
+    field: bool,
+    /// A field's struct's type parameters, which `returns` may name.
+    params: Vec<String>,
+}
+
+/// A module a struct path can name.
+enum Within {
+    Exact(String),
+    /// This module or any ending in it: `a::Job` through a `use`.
+    EndsIn(String),
+    Any,
+}
+
+impl Within {
+    fn matches(&self, m: &str) -> bool {
+        match self {
+            Within::Exact(x) => m == x,
+            Within::EndsIn(x) => m == x || m.ends_with(&format!("::{x}")),
+            Within::Any => true,
+        }
+    }
+}
+
+fn join_module(base: &str, rest: &[String]) -> String {
+    let base = base
+        .split("::")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    base.chain(rest.iter().cloned())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+/// Where a struct literal is written: its module, and the `use` items it sees.
+struct Site<'a> {
+    here: &'a str,
+    imports: &'a [&'a Imports],
+    /// The const or static's declared type.
+    item_ty: &'a Type,
+}
+
+impl Site<'_> {
+    /// `path` with its first segment replaced by the path a `use` brought it in by.
+    fn expand(&self, path: &[String]) -> Vec<String> {
+        let Some((first, rest)) = path.split_first() else {
+            return vec![];
+        };
+        match self.imports.iter().find_map(|i| i.paths.get(first)) {
+            Some(full) => full.iter().chain(rest).cloned().collect(),
+            None => path.to_vec(),
+        }
+    }
+}
+
+/// The modules `qual::Owner` written at `site` can name, most specific first:
+/// exact ones, then the modules of its glob imports, then looser matches.
+/// `roots` are the crate roots' modules.
+// When no exact module, re-export or glob defines it (a `#[path]` file, a
+// macro-made module), a bare name falls back to one match anywhere, and a
+// relative path to modules ending in it.
+fn struct_modules(qual: &[String], site: &Site, roots: &[String]) -> Vec<Within> {
+    let mut found = exact_modules(qual, site.here, roots);
+    match qual.first().map(String::as_str) {
+        None => {
+            let globs = site.imports.iter().flat_map(|i| &i.glob_paths);
+            found.extend(globs.flat_map(|g| exact_modules(g, site.here, roots)));
+            found.push(Within::Any);
+        }
+        Some("crate" | "self" | "super") => {}
+        Some(_) => found.push(Within::EndsIn(qual.join("::"))),
+    }
+    found
+}
+
+/// The modules `qual` names exactly, written in module `here`.
+fn exact_modules(qual: &[String], here: &str, roots: &[String]) -> Vec<Within> {
+    match qual.first().map(String::as_str) {
+        None => vec![Within::Exact(here.into())],
+        Some("crate") => roots
+            .iter()
+            .map(|r| Within::Exact(join_module(r, &qual[1..])))
+            .collect(),
+        Some("self" | "super") => {
+            let rest = if qual[0] == "self" { &qual[1..] } else { qual };
+            let ups = rest.iter().take_while(|s| *s == "super").count();
+            let mut base: Vec<_> = here.split("::").filter(|s| !s.is_empty()).collect();
+            base.truncate(base.len().saturating_sub(ups));
+            vec![Within::Exact(join_module(&base.join("::"), &rest[ups..]))]
+        }
+        Some(_) => std::iter::once(Within::Exact(join_module(here, qual)))
+            .chain(roots.iter().map(|r| Within::Exact(join_module(r, qual))))
+            .collect(),
+    }
+}
+
+/// The one return type all the matches agree on, if they do.
+fn agreed<'e>(picked: &[&'e IndexEntry]) -> Option<&'e Returns> {
+    let first = &picked.first()?.returns;
+    picked.iter().all(|e| e.returns == *first).then_some(first)
 }
 
 /// Signatures from one file, backed by every crate the file is compiled into.
@@ -450,6 +906,33 @@ struct Index<'a> {
     /// Every crate the file is compiled into. Matches from all of them are
     /// pooled, so crates that disagree leave the callee unknown.
     krates: Vec<&'a [IndexEntry]>,
+    /// Modules of the roots of those crates, for `crate::` paths.
+    roots: Vec<String>,
+    /// The module-level `use` items of those crates, to follow re-exports.
+    uses: Vec<&'a [UseEntry]>,
+}
+
+/// A module-level `use` item: `name` in `module` is `path`. A glob's name is `*`.
+#[derive(Clone)]
+struct UseEntry {
+    module: String,
+    name: String,
+    path: Vec<String>,
+}
+
+fn use_entries(module: &str, c: &Collector) -> Vec<UseEntry> {
+    let mut out = vec![];
+    for (at, imports) in &c.imports.names {
+        let module = path_id(module, at, "");
+        let named = imports.paths.iter().map(|(n, p)| (n.clone(), p));
+        let globs = imports.glob_paths.iter().map(|p| ("*".to_string(), p));
+        out.extend(named.chain(globs).map(|(name, path)| UseEntry {
+            module: module.clone(),
+            name,
+            path: path.clone(),
+        }));
+    }
+    out
 }
 
 impl Index<'_> {
@@ -463,12 +946,56 @@ impl Index<'_> {
         if picked.is_empty() {
             picked = self.in_crate(c, owner);
         }
-        let first = &picked.first()?.returns;
-        picked.iter().all(|e| e.returns == *first).then_some(first)
+        agreed(&picked)
+    }
+
+    /// What the closure in field `name` of struct `path` (`Job`, `a::Job`)
+    /// returns, for a struct literal written at `site`.
+    fn field(&self, path: &[String], name: &str, site: &Site, args: &[String]) -> Option<Returns> {
+        let path = site.expand(path);
+        let (owner, qual) = path.split_last()?;
+        let found = struct_modules(qual, site, &self.roots)
+            .into_iter()
+            .find_map(|w| Some(self.field_in(&w, owner, name, 0)).filter(|p| !p.is_empty()))?;
+        let params = &found.first()?.params;
+        Some(substitute(agreed(&found)?.clone(), params, args))
+    }
+
+    /// Field `name` of struct `owner` in the modules `w` matches, or brought
+    /// into one of them by a `use`: `pub use jobs::Job` makes `crate::Job` it.
+    fn field_in(&self, w: &Within, owner: &str, name: &str, depth: usize) -> Vec<&IndexEntry> {
+        let direct: Vec<_> = (self.file.iter())
+            .chain(self.krates.iter().flat_map(|k| k.iter()))
+            .filter(|e| e.field && e.name == name && e.owner.as_deref() == Some(owner))
+            .filter(|e| w.matches(&e.module))
+            .collect();
+        match w {
+            // Glob imports can form cycles; real re-export chains are short.
+            Within::Exact(m) if direct.is_empty() && depth < 4 => {
+                self.reexported(m, owner, name, depth)
+            }
+            _ => direct,
+        }
+    }
+
+    fn reexported(&self, module: &str, owner: &str, name: &str, depth: usize) -> Vec<&IndexEntry> {
+        let uses = (self.uses.iter().flat_map(|u| u.iter()))
+            .filter(|u| u.module == module && (u.name == owner || u.name == "*"));
+        let mut found = vec![];
+        for u in uses {
+            let (target, qual) = match u.path.split_last() {
+                Some((target, qual)) if u.name != "*" => (target.as_str(), qual),
+                _ => (owner, &u.path[..]),
+            };
+            for w in exact_modules(qual, module, &self.roots) {
+                found.extend(self.field_in(&w, target, name, depth + 1));
+            }
+        }
+        found
     }
 
     fn in_file(&self, c: &Callee, owner: Option<&str>) -> Vec<&IndexEntry> {
-        let named = || self.file.iter().filter(|e| e.name == c.name);
+        let named = || self.file.iter().filter(|e| e.name == c.name && !e.field);
         match owner {
             Some(o) if named().any(|e| e.owner.as_deref() == Some(o)) => {
                 named().filter(|e| e.owner.as_deref() == Some(o)).collect()
@@ -486,7 +1013,7 @@ impl Index<'_> {
             .krates
             .iter()
             .flat_map(|k| k.iter())
-            .filter(|e| e.name == c.name);
+            .filter(|e| e.name == c.name && !e.field);
         match owner {
             Some(o) if o.starts_with(char::is_uppercase) => {
                 named.filter(|e| e.owner.as_deref() == Some(o)).collect()
@@ -759,14 +1286,19 @@ fn ok_err(e: &Expr) -> Option<(String, Option<&Expr>)> {
 }
 
 fn count_try(tokens: TokenStream) -> usize {
+    try_lines(tokens).len()
+}
+
+/// The line of each `?` token.
+fn try_lines(tokens: TokenStream) -> Vec<usize> {
     tokens
         .into_iter()
-        .map(|t| match t {
-            TokenTree::Punct(p) if p.as_char() == '?' => 1,
-            TokenTree::Group(g) => count_try(g.stream()),
-            _ => 0,
+        .flat_map(|t| match t {
+            TokenTree::Punct(p) if p.as_char() == '?' => vec![p.span().start().line],
+            TokenTree::Group(g) => try_lines(g.stream()),
+            _ => vec![],
         })
-        .sum()
+        .collect()
 }
 
 fn strip_await(mut e: &Expr) -> &Expr {
@@ -1016,6 +1548,396 @@ fn only_local_jumps(nodes: &[Node], tags: &[Option<&str>], in_loop: bool) -> boo
     })
 }
 
+/// Where a name is written: its line and column.
+type Pos = (usize, usize);
+
+fn ident_at(i: &syn::Ident) -> Pos {
+    let at = i.span().start();
+    (at.line, at.column)
+}
+
+/// Use sites of the locals a fn hands on, each resolved to its own binding,
+/// so a namesake in an inner block or closure doesn't count.
+fn handed_on_fn(sig: &syn::Signature, b: &Block) -> HashSet<Pos> {
+    let mut names = Bindings::default();
+    names.plain(|names| {
+        for arg in &sig.inputs {
+            if let syn::FnArg::Typed(t) = arg {
+                names.bind(&t.pat);
+            }
+        }
+        names.visit_block(b);
+    });
+    let mut h = HandedOn::default();
+    // A fn returning `()` hands nothing on through its value.
+    if !matches!(&sig.output, ReturnType::Default) && !is_unit(&sig.output) {
+        h.tail(b);
+    }
+    h.visit_block(b);
+    h.settle(&names);
+    names.uses_of(&h.uses)
+}
+
+fn is_unit(out: &ReturnType) -> bool {
+    matches!(out, ReturnType::Type(_, t) if matches!(&**t, Type::Tuple(t) if t.elems.is_empty()))
+}
+
+fn handed_on_closure(c: &syn::ExprClosure) -> HashSet<Pos> {
+    let mut names = Bindings::default();
+    names.visit_expr_closure(c);
+    let mut h = HandedOn::default();
+    h.run(c);
+    h.settle(&names);
+    names.uses_of(&h.uses)
+}
+
+/// Each use of a local, by position, mapped to the binding it names.
+// A macro's names are seen when its tokens parse as expressions, as in `vec![r?]`.
+#[derive(Default)]
+struct Bindings {
+    scopes: Vec<Scope>,
+    uses: HashMap<Pos, Pos>,
+}
+
+#[derive(Default)]
+struct Scope {
+    names: Vec<(String, Pos)>,
+    /// Runs whenever the scope around it does: a plain block, not a branch,
+    /// loop or closure body.
+    plain: bool,
+}
+
+impl Bindings {
+    /// A scope that may not run.
+    fn scoped(&mut self, f: impl FnOnce(&mut Self)) {
+        self.within(false, f);
+    }
+
+    fn plain(&mut self, f: impl FnOnce(&mut Self)) {
+        self.within(true, f);
+    }
+
+    fn within(&mut self, plain: bool, f: impl FnOnce(&mut Self)) {
+        self.scopes.push(Scope {
+            names: vec![],
+            plain,
+        });
+        f(self);
+        self.scopes.pop();
+    }
+
+    fn bind(&mut self, p: &syn::Pat) {
+        let mut at = PatAt::default();
+        at.visit_pat(p);
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.names.extend(at.0);
+        }
+    }
+
+    /// Every use of a binding that one of `handed` names.
+    fn uses_of(&self, handed: &[Pos]) -> HashSet<Pos> {
+        let decls: HashSet<_> = handed.iter().filter_map(|u| self.uses.get(u)).collect();
+        self.uses
+            .iter()
+            .filter(|(_, d)| decls.contains(d))
+            .map(|(u, _)| *u)
+            .collect()
+    }
+}
+
+/// Every identifier a pattern binds, with where it's written.
+#[derive(Default)]
+struct PatAt(Vec<(String, Pos)>);
+
+impl<'ast> Visit<'ast> for PatAt {
+    fn visit_pat_ident(&mut self, p: &'ast syn::PatIdent) {
+        let name = p.ident.to_string();
+        // `None` or `Ordering::Less` written bare is a constant, not a binding.
+        if name.starts_with(|c: char| c.is_lowercase() || c == '_') {
+            self.0.push((name, ident_at(&p.ident)));
+        }
+        visit::visit_pat_ident(self, p);
+    }
+}
+
+impl<'ast> Visit<'ast> for Bindings {
+    fn visit_item(&mut self, _: &'ast syn::Item) {}
+
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        for e in macro_exprs(m) {
+            <Self as Visit<'_>>::visit_expr(self, &e);
+        }
+    }
+
+    /// `r = x` that runs whenever `r`'s scope does replaces `r`: later uses
+    /// name the new value. Inside a branch, loop or closure it may not run, so
+    /// the old one stays.
+    fn visit_expr_assign(&mut self, a: &'ast syn::ExprAssign) {
+        self.visit_expr(&a.right);
+        let Expr::Path(p) = &*a.left else {
+            return self.visit_expr(&a.left);
+        };
+        let Some(i) = p.path.get_ident() else { return };
+        let declared = (self.scopes.iter()).rposition(|s| s.names.iter().any(|(n, _)| i == n));
+        match declared {
+            Some(at) if self.scopes[at + 1..].iter().all(|s| s.plain) => {
+                self.scopes[at].names.push((i.to_string(), ident_at(i)));
+            }
+            _ => self.visit_expr_path(p),
+        }
+    }
+
+    fn visit_block(&mut self, b: &'ast Block) {
+        self.plain(|s| visit::visit_block(s, b));
+    }
+
+    /// A labelled block can be left early with `break 'label`.
+    fn visit_expr_block(&mut self, b: &'ast syn::ExprBlock) {
+        match b.label {
+            Some(_) => self.scoped(|s| s.visit_block(&b.block)),
+            None => self.visit_block(&b.block),
+        }
+    }
+
+    fn visit_expr_loop(&mut self, l: &'ast syn::ExprLoop) {
+        self.scoped(|s| s.visit_block(&l.body));
+    }
+
+    fn visit_expr_async(&mut self, a: &'ast syn::ExprAsync) {
+        self.scoped(|s| s.visit_block(&a.block));
+    }
+
+    /// The right of `&&` and `||` may not run.
+    fn visit_expr_binary(&mut self, b: &'ast syn::ExprBinary) {
+        self.visit_expr(&b.left);
+        match b.op {
+            syn::BinOp::And(_) | syn::BinOp::Or(_) => self.scoped(|s| s.visit_expr(&b.right)),
+            _ => self.visit_expr(&b.right),
+        }
+    }
+
+    fn visit_local(&mut self, l: &'ast syn::Local) {
+        if let Some(init) = &l.init {
+            self.visit_local_init(init);
+        }
+        self.bind(&l.pat);
+    }
+
+    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
+        self.scoped(|s| {
+            c.inputs.iter().for_each(|p| s.bind(p));
+            s.visit_expr(&c.body);
+        });
+    }
+
+    fn visit_arm(&mut self, a: &'ast syn::Arm) {
+        self.scoped(|s| {
+            s.bind(unguarded(&a.pat));
+            if let syn::Pat::Guard(g) = &a.pat {
+                s.visit_expr(&g.guard);
+            }
+            s.visit_expr(&a.body);
+        });
+    }
+
+    /// `if let` bindings reach the then branch only.
+    fn visit_expr_if(&mut self, i: &'ast syn::ExprIf) {
+        self.scoped(|s| {
+            s.visit_expr(&i.cond);
+            s.visit_block(&i.then_branch);
+        });
+        if let Some((_, e)) = &i.else_branch {
+            self.scoped(|s| s.visit_expr(e));
+        }
+    }
+
+    fn visit_expr_while(&mut self, w: &'ast syn::ExprWhile) {
+        self.scoped(|s| {
+            s.visit_expr(&w.cond);
+            s.visit_block(&w.body);
+        });
+    }
+
+    fn visit_expr_let(&mut self, l: &'ast syn::ExprLet) {
+        self.visit_expr(&l.expr);
+        self.bind(&l.pat);
+    }
+
+    fn visit_expr_for_loop(&mut self, f: &'ast syn::ExprForLoop) {
+        self.visit_expr(&f.expr);
+        self.scoped(|s| {
+            s.bind(&f.pat);
+            s.visit_block(&f.body);
+        });
+    }
+
+    fn visit_expr_path(&mut self, p: &'ast syn::ExprPath) {
+        let Some(i) = p.path.get_ident() else { return };
+        let decl = self.scopes.iter().rev().flat_map(|s| s.names.iter().rev());
+        if let Some((_, at)) = decl.into_iter().find(|(n, _)| i == n) {
+            self.uses.insert(ident_at(i), *at);
+        }
+    }
+}
+
+/// Uses handed on to the caller: `x?`, `return x`, or `x` as the value of
+/// the fn or of a closure that runs where its value goes on.
+#[derive(Default)]
+struct HandedOn<'a> {
+    uses: Vec<Pos>,
+    /// `let x = e` and `x = e`, by where `x` is written: if `x` goes on,
+    /// so does `e`'s value.
+    aliases: Vec<(Pos, &'a Expr)>,
+}
+
+impl<'a> HandedOn<'a> {
+    /// A closure that runs: its value, `?` and `return` go to whoever called it.
+    fn run(&mut self, c: &'a syn::ExprClosure) {
+        self.value(&c.body);
+        self.visit_expr(&c.body);
+    }
+
+    /// Follows values through locals: `let out = traced(|| r); out` hands on
+    /// `r`, and `let f = || r; f()` runs `f`. Each alias is followed once.
+    fn settle(&mut self, names: &Bindings) {
+        let decl = |p: &Pos| names.uses.get(p).copied().unwrap_or(*p);
+        let mut pending = std::mem::take(&mut self.aliases);
+        loop {
+            let handed: HashSet<Pos> = self.uses.iter().map(decl).collect();
+            let Some(i) = pending
+                .iter()
+                .position(|(at, _)| handed.contains(&decl(at)))
+            else {
+                return;
+            };
+            let (_, e) = pending.swap_remove(i);
+            self.value(e);
+            pending.append(&mut self.aliases);
+        }
+    }
+
+    fn name(&mut self, e: &Expr) {
+        if let Expr::Path(p) = e
+            && let Some(i) = p.path.get_ident()
+        {
+            self.uses.push(ident_at(i));
+        }
+    }
+
+    /// The locals an expression's value can be: through blocks and branches,
+    /// and what it builds (`Ok(Job { run: || r })`, `(a, b)`).
+    fn value(&mut self, e: &'a Expr) {
+        match e {
+            Expr::Block(b) => self.tail(&b.block),
+            Expr::Paren(p) => self.value(&p.expr),
+            Expr::If(i) => {
+                self.tail(&i.then_branch);
+                if let Some((_, e)) = &i.else_branch {
+                    self.value(e);
+                }
+            }
+            Expr::Match(m) => m.arms.iter().for_each(|a| self.value(&a.body)),
+            Expr::Await(a) => self.value(&a.base),
+            Expr::Call(c) => self.call(c),
+            Expr::MethodCall(c) => self.closure_args(&c.args),
+            // A closure or future handed on runs wherever it goes.
+            Expr::Closure(c) => self.run(c),
+            Expr::Async(a) => {
+                self.tail(&a.block);
+                self.visit_block(&a.block);
+            }
+            Expr::Struct(s) => s.fields.iter().for_each(|f| self.value(&f.expr)),
+            Expr::Tuple(t) => t.elems.iter().for_each(|e| self.value(e)),
+            Expr::Array(a) => a.elems.iter().for_each(|e| self.value(e)),
+            e => self.name(e),
+        }
+    }
+
+    fn tail(&mut self, b: &'a Block) {
+        if let Some(Stmt::Expr(e, None)) = b.stmts.last() {
+            self.value(e);
+        }
+    }
+
+    /// A call whose value goes on: `traced(|| r)` runs its closure, and `f()`
+    /// hands on `f`, so a stored closure `f` runs. A closure whose value goes
+    /// nowhere the caller sees (a call made as a statement, `drop`) hands nothing on.
+    fn call(&mut self, c: &'a syn::ExprCall) {
+        let discards = matches!(&*c.func, Expr::Path(p)
+            if p.path.segments.last().is_some_and(|s| s.ident == "drop" || s.ident == "forget"));
+        if !discards {
+            self.closure_args(&c.args);
+            self.name(&c.func);
+        }
+    }
+
+    fn closure_args(&mut self, args: &'a Punctuated<Expr, Token![,]>) {
+        for a in args {
+            if let Expr::Closure(c) = a {
+                self.run(c);
+            }
+        }
+    }
+}
+
+impl<'a> Visit<'a> for HandedOn<'a> {
+    fn visit_item(&mut self, _: &'a syn::Item) {}
+
+    /// A closure's body hands on only if the closure runs; see `run`.
+    fn visit_expr_closure(&mut self, _: &'a syn::ExprClosure) {}
+
+    /// Likewise a future only if it's polled: awaited or handed on; see `value`.
+    fn visit_expr_async(&mut self, _: &'a syn::ExprAsync) {}
+
+    fn visit_local(&mut self, l: &'a syn::Local) {
+        let pat = match &l.pat {
+            syn::Pat::Type(t) => &*t.pat,
+            p => p,
+        };
+        if let (syn::Pat::Ident(p), Some(init)) = (pat, &l.init) {
+            self.aliases.push((ident_at(&p.ident), &init.expr));
+        }
+        visit::visit_local(self, l);
+    }
+
+    fn visit_expr_assign(&mut self, a: &'a syn::ExprAssign) {
+        if let Expr::Path(p) = &*a.left
+            && let Some(i) = p.path.get_ident()
+        {
+            self.aliases.push((ident_at(i), &a.right));
+        }
+        visit::visit_expr_assign(self, a);
+    }
+
+    fn visit_expr_try(&mut self, t: &'a syn::ExprTry) {
+        self.value(&t.expr);
+        visit::visit_expr_try(self, t);
+    }
+
+    fn visit_expr_return(&mut self, r: &'a syn::ExprReturn) {
+        if let Some(e) = &r.expr {
+            self.value(e);
+        }
+        visit::visit_expr_return(self, r);
+    }
+
+    /// A macro's arguments, when they parse, as in `vec![r?]`.
+    fn visit_macro(&mut self, m: &'a syn::Macro) {
+        for e in macro_exprs(m) {
+            let mut inner = HandedOn::default();
+            inner.visit_expr(&e);
+            self.uses.extend(inner.uses);
+        }
+    }
+}
+
+/// A macro's tokens as comma-separated expressions, when they parse.
+fn macro_exprs(m: &syn::Macro) -> Vec<Expr> {
+    m.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+        .map(|args| args.into_iter().collect())
+        .unwrap_or_default()
+}
+
 /// Local bindings and parameters, in order.
 #[derive(Default)]
 pub(crate) struct Locals(pub(crate) Vec<String>);
@@ -1048,9 +1970,26 @@ struct Imports {
     names: HashMap<String, (String, String)>,
     /// Roots of `use x::*`.
     globs: Vec<String>,
+    /// Name in scope → the whole path it was brought in by.
+    paths: HashMap<String, Vec<String>>,
+    /// Whole paths of `use x::*`.
+    glob_paths: Vec<Vec<String>>,
 }
 
 impl Imports {
+    /// `use a::b::{self as c}` brings in `a::b` as `c`.
+    fn add_path(&mut self, prefix: &[String], ident: &syn::Ident, name: &syn::Ident) {
+        let mut path = prefix.to_vec();
+        if ident != "self" {
+            path.push(ident.to_string());
+        }
+        let name = match (name == "self", path.last()) {
+            (true, Some(last)) => last.clone(),
+            _ => name.to_string(),
+        };
+        self.paths.insert(name, path);
+    }
+
     fn add(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
         let root = |prefix: &[String], own: &syn::Ident| {
             prefix.first().cloned().unwrap_or_else(|| own.to_string())
@@ -1064,12 +2003,17 @@ impl Imports {
             syn::UseTree::Name(n) => {
                 let entry = (root(prefix, &n.ident), n.ident.to_string());
                 self.names.insert(n.ident.to_string(), entry);
+                self.add_path(prefix, &n.ident, &n.ident);
             }
             syn::UseTree::Rename(r) => {
                 let entry = (root(prefix, &r.ident), r.ident.to_string());
                 self.names.insert(r.rename.to_string(), entry);
+                self.add_path(prefix, &r.ident, &r.rename);
             }
-            syn::UseTree::Glob(_) => self.globs.extend(prefix.first().cloned()),
+            syn::UseTree::Glob(_) => {
+                self.globs.extend(prefix.first().cloned());
+                self.glob_paths.push(prefix.clone());
+            }
             syn::UseTree::Group(g) => g.items.iter().for_each(|t| self.add(t, prefix)),
         }
     }
@@ -1692,9 +2636,34 @@ struct Walker<'a> {
     /// The expression being visited is what a step applies to, so an adapter
     /// on it belongs to that step.
     in_step: bool,
+    /// Uses of locals the fn hands on to its caller; see `handed_on_fn`.
+    handed_on: HashSet<Pos>,
 }
 
-impl Walker<'_> {
+impl<'a> Walker<'a> {
+    fn new(
+        index: &'a Index<'a>,
+        imports: &'a [&'a Imports],
+        allows: &'a [Allow],
+        owner: Option<&'a str>,
+        default_err: Option<String>,
+        handed_on: HashSet<Pos>,
+    ) -> Self {
+        Walker {
+            index,
+            imports,
+            block_imports: vec![],
+            allows,
+            owner,
+            nodes: vec![],
+            tail: true,
+            default_err,
+            macro_try: 0,
+            in_step: false,
+            handed_on,
+        }
+    }
+
     /// Walk `f` into a fresh node list (one branch arm / scope body).
     fn arm(&mut self, f: impl FnOnce(&mut Self)) -> Vec<Node> {
         let outer = std::mem::take(&mut self.nodes);
@@ -1706,6 +2675,13 @@ impl Walker<'_> {
         let saved = std::mem::replace(&mut self.tail, tail);
         f(self);
         self.tail = saved;
+    }
+
+    /// `&x` where `x` goes on to the caller: reading the error isn't handling it.
+    fn only_reads(&self, e: &Expr) -> bool {
+        matches!(e, Expr::Reference(r) if r.mutability.is_none()
+            && matches!(&*r.expr, Expr::Path(p)
+                if p.path.get_ident().is_some_and(|i| self.handed_on.contains(&ident_at(i)))))
     }
 
     fn push_branch(&mut self, label: String, arms: Vec<Arm>) {
@@ -1860,8 +2836,9 @@ impl Walker<'_> {
     // Assumes the body runs inline and its result is returned, as in a
     // `traced(|| ..)` wrapper. A stored closure is drawn the same, and a
     // `return Ok` inside a closure is drawn as reaching Done.
-    fn scope(&mut self, label: String, walk: impl FnOnce(&mut Self)) {
-        let saved = self.default_err.take();
+    /// `default_err` is what `?` converts into there, when a type says.
+    fn scope(&mut self, label: String, default_err: Option<String>, walk: impl FnOnce(&mut Self)) {
+        let saved = std::mem::replace(&mut self.default_err, default_err);
         let body = self.arm(|w| w.with_tail(true, walk));
         self.default_err = saved;
         if !body.is_empty() {
@@ -1901,9 +2878,14 @@ impl Walker<'_> {
     }
 
     fn closure(&mut self, label: String, c: &syn::ExprClosure) {
+        let err = closure_returns(c).as_ref().and_then(default_err);
+        self.scope(label, err, |w| w.closure_body(c));
+    }
+
+    fn closure_body(&mut self, c: &syn::ExprClosure) {
         match &*c.body {
-            Expr::Async(a) => self.scope(label, |w| w.visit_block(&a.block)),
-            body => self.scope(label, |w| w.tail_expr(body)),
+            Expr::Async(a) => self.visit_block(&a.block),
+            body => self.tail_expr(body),
         }
     }
 
@@ -1911,7 +2893,7 @@ impl Walker<'_> {
         for a in args {
             match a {
                 Expr::Closure(c) => self.closure(label.to_string(), c),
-                Expr::Async(b) => self.scope(label.to_string(), |w| w.visit_block(&b.block)),
+                Expr::Async(b) => self.scope(label.to_string(), None, |w| w.visit_block(&b.block)),
                 _ => self.with_tail(false, |w| w.visit_expr(a)),
             }
         }
@@ -2051,6 +3033,7 @@ impl<'ast> Visit<'ast> for Walker<'_> {
                 let tag = result_pat(&l.pat);
                 let how = tag
                     .as_ref()
+                    .filter(|_| !self.only_reads(&l.expr))
                     .map(|t| (format!("if let {t}"), vec![canon(&*l.pat)]));
                 // The error arm: `then` for `if let Err`, `else` for `if let Ok`.
                 let recorded = match (tag.as_deref(), &i.else_branch) {
@@ -2108,7 +3091,7 @@ impl<'ast> Visit<'ast> for Walker<'_> {
         }
         // A returned local may hold an error, so the match can't claim to handle one.
         let opaque = returns && self.default_err.is_some() && handed.contains(&Handed::Local);
-        let how = (on_result && !opaque).then(|| {
+        let how = (on_result && !opaque && !self.only_reads(&m.expr)).then(|| {
             (
                 "match".to_string(),
                 m.arms.iter().map(|a| canon(&a.pat)).collect(),
@@ -2255,7 +3238,7 @@ impl<'ast> Visit<'ast> for Walker<'_> {
     }
 
     fn visit_expr_async(&mut self, a: &'ast syn::ExprAsync) {
-        self.scope("async block".into(), |w| w.visit_block(&a.block));
+        self.scope("async block".into(), None, |w| w.visit_block(&a.block));
     }
 
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
@@ -2379,6 +3362,7 @@ impl Report {
             findings: vec![],
             parse_failures: vec![],
             support_files_skipped: 0,
+            unanalysed_try: vec![],
             test_files: HashSet::new(),
             pending: vec![],
         }
@@ -2394,48 +3378,27 @@ impl Report {
         module: &str,
         src: &str,
         collector: &Collector,
-        krates: Vec<&[IndexEntry]>,
+        index: &Index,
     ) {
-        let index = Index {
-            file: collector
-                .out
-                .iter()
-                .map(|f| index_entry(module, f))
-                .collect(),
-            krates,
-        };
         let (allows, bad) = parse_allows(src);
         for f in &collector.out {
             let ret = returns(&f.sig.output);
-            let default_err = match &ret {
-                Returns::Result { error } => Some(error.clone()),
-                Returns::Option => Some("None".into()),
-                Returns::Other => None,
-            };
+            let default_err = default_err(&ret);
             let chain = collector.imports.chain(&f.path, &f.sig.ident.to_string());
-            let mut w = Walker {
-                index: &index,
-                imports: &chain,
-                block_imports: vec![],
-                allows: &allows,
-                owner: f.owner.as_deref(),
-                nodes: vec![],
-                tail: true,
+            let handed_on = f.block.map(|b| handed_on_fn(f.sig, b)).unwrap_or_default();
+            let mut w = Walker::new(
+                index,
+                &chain,
+                &allows,
+                f.owner.as_deref(),
                 default_err,
-                macro_try: 0,
-                in_step: false,
-            };
+                handed_on,
+            );
             if let Some(block) = f.block {
                 w.visit_block(block);
             }
             let name = f.sig.ident.to_string();
-            let segments = std::iter::once(module)
-                .chain(f.path.iter().map(String::as_str))
-                .chain([name.as_str()]);
-            let id = segments
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join("::");
+            let id = path_id(module, &f.path, &name);
             let (nodes, macro_try) = (w.nodes, w.macro_try);
             let mut locals = Locals::default();
             locals.visit_signature(f.sig);
@@ -2454,6 +3417,9 @@ impl Report {
                 locals,
             });
         }
+        for k in &collector.consts {
+            self.walk_const(file, module, k, collector, index, &allows);
+        }
         self.findings
             .extend(bad.into_iter().map(|(line, message)| Finding {
                 rule: BAD_ALLOW.into(),
@@ -2464,6 +3430,66 @@ impl Report {
                 confidence: Confidence::Certain,
                 allowed: None,
             }));
+    }
+
+    /// Each closure in a `const` or `static` as a function of its own, named
+    /// by the struct field it fills (`SCENARIOS::build`), else by the item.
+    fn walk_const(
+        &mut self,
+        file: &str,
+        module: &str,
+        k: &RawConst,
+        collector: &Collector,
+        index: &Index,
+        allows: &[Allow],
+    ) {
+        let item = k.ident.to_string();
+        // The module the item is in: its path less any impl or fn around it.
+        let mut within = k.path.clone();
+        while !within.is_empty() && !collector.imports.modules.contains(&within) {
+            within.pop();
+        }
+        let here = path_id(module, &within, "");
+        let chain = collector.imports.chain(&k.path, &item);
+        let site = Site {
+            here: &here,
+            imports: &chain,
+            item_ty: k.ty,
+        };
+        let mut closures = vec![];
+        let expect = callable_returns(k.ty);
+        const_closures(index, &site, k.expr, "", expect, &mut closures);
+        let mut inside = k.path.clone();
+        inside.push(item.clone());
+        for c in closures {
+            let id = match c.label.as_deref() {
+                Some(field) => path_id(module, &inside, field),
+                None => path_id(module, &k.path, &item),
+            };
+            let ret = c.returns.unwrap_or(Returns::Other);
+            let handed_on = handed_on_closure(c.closure);
+            let mut w = Walker::new(
+                index,
+                &chain,
+                allows,
+                k.owner.as_deref(),
+                default_err(&ret),
+                handed_on,
+            );
+            w.closure_body(c.closure);
+            let mut locals = Locals::default();
+            locals.visit_expr_closure(c.closure);
+            self.functions.push(Function {
+                id,
+                name: c.label.unwrap_or_else(|| item.clone()),
+                file: file.into(),
+                line: line(c.closure),
+                returns: ret,
+                nodes: w.nodes,
+                macro_try: w.macro_try,
+                locals: locals.0,
+            });
+        }
     }
 
     /// `#[cfg(unix)]` / `#[cfg(windows)]` twins share a path: number the repeats.
@@ -2488,7 +3514,9 @@ impl Report {
             })
             .collect();
         for ((file, ..), c) in parsed.iter().zip(&collectors) {
-            self.coverage.item_macro_try += c.item_macro_try;
+            self.coverage.item_macro_try += c.item_macro_try.len();
+            self.unanalysed_try
+                .extend(c.item_macro_try.iter().map(|l| format!("{file}:{l}")));
             self.test_files
                 .extend(c.test_mods.iter().flat_map(|m| mod_files(file, m)));
         }
@@ -2500,20 +3528,48 @@ impl Report {
             .collect();
         let krate_of = crate_roots(&mods);
         let mut crates: HashMap<&str, Vec<IndexEntry>> = HashMap::new();
+        let mut crate_uses: HashMap<&str, Vec<UseEntry>> = HashMap::new();
         for ((file, module, ..), c) in parsed.iter().zip(&collectors) {
             if !self.test_files.contains(*file) {
-                let entries = c.out.iter().map(|f| index_entry(module, f));
+                let (entries, uses) = (index_entries(module, c), use_entries(module, c));
                 for krate in &krate_of[file.as_str()] {
-                    crates.entry(krate).or_default().extend(entries.clone());
+                    crates
+                        .entry(krate)
+                        .or_default()
+                        .extend(entries.iter().cloned());
+                    crate_uses
+                        .entry(krate)
+                        .or_default()
+                        .extend(uses.iter().cloned());
                 }
             }
         }
+        let module_by_file: HashMap<&str, &str> = parsed
+            .iter()
+            .map(|(file, module, ..)| (file.as_str(), module.as_str()))
+            .collect();
         for ((file, module, src, _), c) in parsed.iter().zip(&collectors) {
-            let krates = krate_of[file.as_str()]
-                .iter()
-                .filter_map(|k| crates.get(k.as_str()).map(Vec::as_slice))
-                .collect();
-            self.walk_file(file, module, src, c, krates);
+            let mine = &krate_of[file.as_str()];
+            let index = Index {
+                file: index_entries(module, c),
+                krates: mine
+                    .iter()
+                    .filter_map(|k| crates.get(k.as_str()).map(Vec::as_slice))
+                    .collect(),
+                roots: mine
+                    .iter()
+                    .map(|k| {
+                        module_by_file
+                            .get(k.as_str())
+                            .map_or_else(|| module_of(Path::new(k)), |m| m.to_string())
+                    })
+                    .collect(),
+                uses: mine
+                    .iter()
+                    .filter_map(|k| crate_uses.get(k.as_str()).map(Vec::as_slice))
+                    .collect(),
+            };
+            self.walk_file(file, module, src, c, &index);
         }
         let test_files = std::mem::take(&mut self.test_files);
         self.functions.retain(|f| !test_files.contains(&f.file));
@@ -2538,18 +3594,42 @@ impl Report {
     }
 }
 
-fn index_entry(module: &str, f: &RawFn) -> IndexEntry {
-    let module = std::iter::once(module)
-        .chain(f.path.iter().map(String::as_str))
+/// `module::path::name`, skipping empty parts.
+fn path_id(module: &str, path: &[String], name: &str) -> String {
+    std::iter::once(module)
+        .chain(path.iter().map(String::as_str))
+        .chain([name])
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
-        .join("::");
+        .join("::")
+}
+
+fn index_entry(module: &str, f: &RawFn) -> IndexEntry {
     IndexEntry {
         owner: f.owner.clone(),
         name: f.sig.ident.to_string(),
         returns: returns(&f.sig.output),
-        module,
+        module: path_id(module, &f.path, ""),
+        field: false,
+        params: vec![],
     }
+}
+
+/// A file's fns and closure-holding struct fields, for lookups.
+fn index_entries(module: &str, c: &Collector) -> Vec<IndexEntry> {
+    let fields = c.fields.iter().map(|f| IndexEntry {
+        owner: Some(f.owner.clone()),
+        name: f.name.clone(),
+        returns: f.returns.clone(),
+        module: path_id(module, &f.path, ""),
+        field: true,
+        params: f.params.clone(),
+    });
+    c.out
+        .iter()
+        .map(|f| index_entry(module, f))
+        .chain(fields)
+        .collect()
 }
 
 /// Where `mod name;` declared in `file` can live.
@@ -2662,7 +3742,8 @@ fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<
         let (path, name) = (e.path(), e.file_name());
         let name = name.to_string_lossy();
         if path.is_dir() {
-            if !name.starts_with('.') && name != "target" {
+            // Cargo tags its target dir, whatever CARGO_TARGET_DIR named it.
+            if !name.starts_with('.') && name != "target" && !path.join("CACHEDIR.TAG").is_file() {
                 rust_files(&path, out)?;
             }
         } else if path.extension().is_some_and(|x| x == "rs") {

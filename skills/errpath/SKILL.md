@@ -70,7 +70,7 @@ cargo errpath diagram src/transfer.rs transfer   # Mermaid
 cargo errpath ir src                             # versioned JSON
 ```
 
-Each `?` becomes a step with an exit to its error. An error handled in place, such as `if let Err(e) = a() { log(e) }`, becomes a handled step that carries on. Error names come from callee signatures anywhere in the same crate, and other steps show the enclosing function's error. Review comments include the changed function's diagram.
+Each `?` becomes a step with an exit to its error. An error handled in place, such as `if let Err(e) = a() { log(e) }`, becomes a handled step that carries on. Error names come from callee signatures anywhere in the same crate, and other steps show the enclosing function's error. A closure stored in a `const` or `static` gets a function of its own, named by the field it fills (`SCENARIOS::build`). Review comments include the changed function's diagram.
 
 ## GitHub Action
 

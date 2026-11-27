@@ -71,9 +71,10 @@ pub fn top() -> Option<PathBuf> {
 }
 
 /// Where the branch started from: the remote's default branch, else `main`
-/// or `master`, else `HEAD`, which reviews only uncommitted edits.
-pub fn default_base() -> &'static str {
-    ["origin/HEAD", "main", "master"]
+/// or `master`, else `HEAD`, which reviews only uncommitted edits. Before
+/// the first commit, the empty tree, so everything counts as new.
+pub fn default_base() -> String {
+    ["origin/HEAD", "main", "master", "HEAD"]
         .into_iter()
         .find(|r| {
             git(&[
@@ -84,7 +85,9 @@ pub fn default_base() -> &'static str {
             ])
             .is_some()
         })
-        .unwrap_or("HEAD")
+        .map(String::from)
+        .or_else(|| git(&["hash-object", "-t", "tree", "--stdin"]))
+        .unwrap_or_else(|| "HEAD".into())
 }
 
 fn finding_lines(findings: &[&NewFinding]) -> String {

@@ -55,7 +55,7 @@ fn main() {
             }
         }
         ["review", ref rest @ ..] => review(rest),
-        ["check"] => check(gate::default_base()),
+        ["check"] => check(&gate::default_base()),
         ["check", "--base", base] => check(base),
         ["init"] => exit(gate::init()),
         ["hook", kind @ ("start" | "edit" | "stop")] => exit(gate::hook(kind)),
